@@ -1,0 +1,34 @@
+SG-Nav + BEHAVIOR / OmniGibson deployment notes
+================================================
+
+1. Python stack conflict
+   - SG-Nav upstream expects Python 3.9, PyTorch <= 1.9, habitat-sim 0.2.4.
+   - BEHAVIOR-1K OmniGibson typically needs newer Python and PyTorch (and Isaac / GPU drivers).
+   Practical options:
+   (a) Two conda envs: run OmniGibson in env A; run SG-Nav in env B; bridge via gRPC/HTTP and pass
+       rgb/depth/pose tensors serialized (heavy but reliable).
+   (b) Single env: try porting SG-Nav to newer PyTorch (GLIP / SAM / pytorch3d may need fixes; high effort).
+   (c) Subprocess: driver script in OmniGibson env spawns `python -m sgnav_service` in SG-Nav env.
+
+2. Coordinate frames
+   - gps_xy in build_habitat_shaped_observations must stay in a fixed episode horizontal frame; compass_rad
+     must match how gps changes when the robot rotates (same convention as Habitat GPS+compass).
+
+3. Camera tilt
+   - apply_sgnav_discrete_action uses no-op for LOOK_UP/LOOK_DOWN unless you pass look_up_fn/look_down_fn.
+     For best parity with Habitat, attach hooks that tilt the mounted vision sensor or head.
+
+4. Entry points
+   - configs/sgnav_minimal.rgbd.yaml: OmegaConf for SG_Nav_Agent without Habitat Env.
+   - utils/behavior_taxonomy.py: map Behavior/BDDL names to MP3D goal ids.
+   - behavior/omnigibson_adapter.py: observation dict + discrete base actions.
+
+5. HTTP bridge (implemented)
+   - SG-Nav side (env B), from SG-Nav repo root:
+       python behavior/sgnav_http_server.py --host 127.0.0.1 --port 8765
+     Endpoints: GET /health ; POST /reset (JSON behavior_goal or object_category) ; POST /step (JSON arrays as base64 blobs, see sgnav_http_server.py).
+   - OmniGibson side (env A), from openpi-comet repo:
+       python scripts/eval_skill_sgnav_http.py --sgnav_url http://127.0.0.1:8765 --task turning_on_radio --total_segments 1
+     Env creation matches scripts/eval_skill_flat.py (load_env / load_task_instance / head rgb+depth).
+   - Subprocess wrapper (no auto-install):
+       conda run -n SG_Nav --no-capture-output python behavior/sgnav_http_server.py --port 8765

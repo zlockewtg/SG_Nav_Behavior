@@ -1,0 +1,6 @@
+[build-system]
+# torch: required so PEP517 isolated builds can import setup.py extension logic.
+# To compile CUDA extensions against your conda PyTorch (recommended), use:
+#   pip install -e . --no-build-isolation --user
+requires = ["setuptools>=61", "wheel", "torch"]
+build-backend = "setuptools.build_meta"

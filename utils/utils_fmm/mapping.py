@@ -56,10 +56,15 @@ class Semantic_Mapping(nn.Module):
         self.feat = torch.ones(1,num_cats,
                           self.screen_h//self.du_scale * self.screen_w//self.du_scale
                          ).float().to(self.device)
-        
+        # When set (cm), depth projection uses this height instead of cfg AGENT_0.HEIGHT*100 (HTTP / zed_link).
+        self._extrinsic_height_cm = None
+
     def set_view_angles(self, view_angle):
         self.view_angles[0] = -view_angle
 
+    def _camera_height_cm_for_projection(self):
+        h = getattr(self, "_extrinsic_height_cm", None)
+        return float(h) if h is not None else float(self.agent_height)
 
     def forward(self, depth, pose_obs, maps_last, type_mask=None, type_prob=None):
         if type_mask is not None:
@@ -69,7 +74,9 @@ class Semantic_Mapping(nn.Module):
 
         point_cloud_t = du.get_point_cloud_from_z_t(depth, self.camera_matrix, self.device, scale=self.du_scale)
         #Multiprocessing
-        agent_view_t = du.transform_camera_view_t_multiple(point_cloud_t, self.agent_height, self.view_angles, self.device)
+        agent_view_t = du.transform_camera_view_t_multiple(
+            point_cloud_t, self._camera_height_cm_for_projection(), self.view_angles, self.device
+        )
 
         agent_view_centered_t = du.transform_pose_t(agent_view_t, self.shift_loc, self.device)
 
@@ -194,7 +201,9 @@ class Semantic_Mapping(nn.Module):
         bs, c, h, w = type_mask.size()
         point_cloud_t = du.get_point_cloud_from_z_t(depth, self.camera_matrix, self.device, scale=self.du_scale)
         #Multiprocessing
-        agent_view_t = du.transform_camera_view_t_multiple(point_cloud_t, self.agent_height, self.view_angles, self.device)
+        agent_view_t = du.transform_camera_view_t_multiple(
+            point_cloud_t, self._camera_height_cm_for_projection(), self.view_angles, self.device
+        )
 
         agent_view_centered_t = du.transform_pose_t(agent_view_t, self.shift_loc, self.device)
 

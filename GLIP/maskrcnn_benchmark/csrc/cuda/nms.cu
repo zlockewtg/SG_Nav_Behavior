@@ -2,8 +2,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include <THC/THC.h>
-#include <THC/THCDeviceUtils.cuh>
+#include "cuda/cuda_compat.cuh"
 
 #include <vector>
 #include <iostream>
@@ -80,13 +79,10 @@ at::Tensor nms_cuda(const at::Tensor boxes, float nms_overlap_thresh) {
 
   scalar_t* boxes_dev = boxes_sorted.data_ptr<scalar_t>();
 
-  THCState *state = at::globalContext().lazyInitCUDA(); // TODO replace with getTHCState
-
-  unsigned long long* mask_dev = NULL;
-  //THCudaCheck(THCudaMalloc(state, (void**) &mask_dev,
-  //                      boxes_num * col_blocks * sizeof(unsigned long long)));
-
-  mask_dev = (unsigned long long*) THCudaMalloc(state, boxes_num * col_blocks * sizeof(unsigned long long));
+  unsigned long long* mask_dev = nullptr;
+  THCudaCheck(cudaMalloc(
+      reinterpret_cast<void**>(&mask_dev),
+      boxes_num * col_blocks * sizeof(unsigned long long)));
 
   dim3 blocks(THCCeilDiv(boxes_num, threadsPerBlock),
               THCCeilDiv(boxes_num, threadsPerBlock));
@@ -95,6 +91,7 @@ at::Tensor nms_cuda(const at::Tensor boxes, float nms_overlap_thresh) {
                                   nms_overlap_thresh,
                                   boxes_dev,
                                   mask_dev);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   std::vector<unsigned long long> mask_host(boxes_num * col_blocks);
   THCudaCheck(cudaMemcpy(&mask_host[0],
@@ -122,7 +119,7 @@ at::Tensor nms_cuda(const at::Tensor boxes, float nms_overlap_thresh) {
     }
   }
 
-  THCudaFree(state, mask_dev);
+  THCudaCheck(cudaFree(mask_dev));
   // TODO improve this part
   return std::get<0>(order_t.index({
                        keep.narrow(/*dim=*/0, /*start=*/0, /*length=*/num_to_keep).to(

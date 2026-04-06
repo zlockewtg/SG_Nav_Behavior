@@ -1,0 +1,4 @@
+skip_edge_llm: false
+edge_max_per_step: 24
+edge_llm_batch_size: 8
+edge_llm_timeout_s: 20.0

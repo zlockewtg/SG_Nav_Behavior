@@ -1,6 +1,8 @@
 import base64
 import math
 import os
+import time
+import threading
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PosixPath
@@ -21,6 +23,7 @@ from utils.utils_scenegraph.mapping import compute_spatial_similarities, merge_d
 from utils.utils_scenegraph.slam_classes import MapObjectList
 from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list, text2value
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
+from utils.utils_glip import CANONICAL_MP3D_GOAL_ORDER
 
 
 ADDITIONAL_PSL_OPTIONS = {
@@ -174,6 +177,7 @@ class SceneGraph():
         self.found_goal_times_threshold = 1
         self.N_max = 10
         self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
+        self._node_space_default = self.node_space
         self.prompt_edge_proposal = '''
 Provide the most possible single spatial relationship for each of the following object pairs. Answer with only one relationship per pair, and separate each answer with a newline character. Do not response superfluous text.
 Example 1:
@@ -205,6 +209,7 @@ Object pair(s):
         self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
         self.set_cfg()
         self.set_agent(agent)
+        self.load_runtime_config()
 
     def reset(self):
         full_w, full_h = self.map_size, self.map_size
@@ -231,6 +236,53 @@ Object pair(s):
             cfg.sim_threshold_spatial = 0.01
         self.cfg = cfg
 
+    def load_runtime_config(self):
+        default_cfg = {
+            "skip_edge_llm": False,
+            "edge_max_per_step": 24,
+            "edge_llm_batch_size": 8,
+            "edge_llm_timeout_s": 20.0,
+        }
+        cfg_path = Path("configs/scenegraph_runtime.yaml")
+        file_cfg = {}
+        if cfg_path.exists():
+            try:
+                file_cfg = omegaconf.OmegaConf.to_container(
+                    omegaconf.OmegaConf.load(str(cfg_path)),
+                    resolve=True,
+                ) or {}
+            except Exception as e:
+                print(f"[scenegraph][cfg] failed to load {cfg_path}: {e}", flush=True)
+                file_cfg = {}
+
+        agent_cfg = {}
+        try:
+            runtime_cfg = {}
+            if hasattr(self.agent, "config") and self.agent.config is not None:
+                c = self.agent.config
+                if hasattr(c, "get"):
+                    runtime_cfg = c.get("SGNAV_RUNTIME", {}) or {}
+                elif hasattr(c, "SGNAV_RUNTIME"):
+                    runtime_cfg = c.SGNAV_RUNTIME
+            if runtime_cfg is None:
+                runtime_cfg = {}
+            if hasattr(runtime_cfg, "get"):
+                agent_cfg = runtime_cfg.get("scenegraph", {}) or {}
+            elif hasattr(runtime_cfg, "scenegraph"):
+                agent_cfg = runtime_cfg.scenegraph
+        except Exception as e:
+            print(f"[scenegraph][cfg] failed to read task runtime config: {e}", flush=True)
+            agent_cfg = {}
+
+        merged = {**default_cfg, **file_cfg, **agent_cfg}
+        self.runtime_cfg = {
+            "skip_edge_llm": bool(merged.get("skip_edge_llm", default_cfg["skip_edge_llm"])),
+            "edge_max_per_step": int(merged.get("edge_max_per_step", default_cfg["edge_max_per_step"])),
+            "edge_llm_batch_size": int(merged.get("edge_llm_batch_size", default_cfg["edge_llm_batch_size"])),
+            "edge_llm_timeout_s": float(merged.get("edge_llm_timeout_s", default_cfg["edge_llm_timeout_s"])),
+        }
+        print(f"[scenegraph][cfg] runtime config: {self.runtime_cfg}", flush=True)
+
     def set_agent(self, agent):
         self.agent = agent
 
@@ -239,6 +291,9 @@ Object pair(s):
         self.obj_goal_sg = obj_goal_sg
         if self.obj_goal in self.threshold_list:
             self.cfg.obj_min_detections = self.threshold_list[self.obj_goal]
+        else:
+            # Unknown/open-vocab goals (e.g. "radio") should not inherit stale thresholds.
+            self.cfg.obj_min_detections = 1
 
     def set_navigate_steps(self, navigate_steps):
         self.navigate_steps = navigate_steps
@@ -645,6 +700,10 @@ Object pair(s):
                 node.is_goal_node = True
 
     def update_edge(self):
+        skip_edge_llm = self.runtime_cfg["skip_edge_llm"]
+        edge_max_per_step = self.runtime_cfg["edge_max_per_step"]
+        edge_llm_batch_size = self.runtime_cfg["edge_llm_batch_size"]
+        edge_llm_timeout_s = self.runtime_cfg["edge_llm_timeout_s"]
         old_nodes = []
         new_nodes = []
         for i, node in enumerate(self.nodes):
@@ -654,6 +713,7 @@ Object pair(s):
             else:
                 old_nodes.append(node)
         if len(new_nodes) == 0:
+            print("[scenegraph][edge] no new nodes, skip", flush=True)
             return
         # create the edge between new_node and old_node
         new_edges = []
@@ -672,31 +732,71 @@ Object pair(s):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
             new_edges = new_edges | node_new_edges
         new_edges = list(new_edges)
+        if len(new_edges) > edge_max_per_step:
+            print(
+                f"[scenegraph][edge] cap unresolved edges for this step: {len(new_edges)} -> {edge_max_per_step}",
+                flush=True,
+            )
+            new_edges = new_edges[:edge_max_per_step]
+        print(f"[scenegraph][edge] unresolved edges before VLM: {len(new_edges)}", flush=True)
         for new_edge in new_edges:
             image = self.get_joint_image(new_edge.node1, new_edge.node2)
             if image is not None:
                 prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
-                response = self.get_vlm_response(prompt=prompt, image=image)
-                response = response.replace('.', '').lower()
-                new_edge.set_relation(response)
+                if skip_edge_llm:
+                    print("[scenegraph][edge] skip VLM by config skip_edge_llm=true", flush=True)
+                else:
+                    t0 = time.time()
+                    print(
+                        f"[scenegraph][edge] VLM start: ({new_edge.node1.caption}, {new_edge.node2.caption})",
+                        flush=True,
+                    )
+                    response = self.get_vlm_response(prompt=prompt, image=image)
+                    dt = time.time() - t0
+                    print(f"[scenegraph][edge] VLM done in {dt:.2f}s", flush=True)
+                    response = response.replace('.', '').lower()
+                    new_edge.set_relation(response)
         new_edges = set()
         for i, node in enumerate(self.nodes):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
             new_edges = new_edges | node_new_edges
         new_edges = list(new_edges)
+        if len(new_edges) > edge_max_per_step:
+            print(
+                f"[scenegraph][edge] cap LLM proposal edges for this step: {len(new_edges)} -> {edge_max_per_step}",
+                flush=True,
+            )
+            new_edges = new_edges[:edge_max_per_step]
+        print(f"[scenegraph][edge] unresolved edges before LLM proposal: {len(new_edges)}", flush=True)
         # get all relation proposals
         if len(new_edges) > 0:
-            node_pairs = []
-            for new_edge in new_edges:
-                node_pairs.append(new_edge.node1.caption)
-                node_pairs.append(new_edge.node2.caption)
-            prompt = self.prompt_edge_proposal + '\n({}, {})' * len(new_edges)
-            prompt = prompt.format(*node_pairs)
-            relations = self.get_llm_response(prompt=prompt)
-            relations = relations.split('\n')
-            if len(relations) == len(new_edges):
-                for i, relation in enumerate(relations):
-                    new_edges[i].set_relation(relation)
+            for batch_start in range(0, len(new_edges), edge_llm_batch_size):
+                batch_edges = new_edges[batch_start:batch_start + edge_llm_batch_size]
+                node_pairs = []
+                for new_edge in batch_edges:
+                    node_pairs.append(new_edge.node1.caption)
+                    node_pairs.append(new_edge.node2.caption)
+                prompt = self.prompt_edge_proposal + '\n({}, {})' * len(batch_edges)
+                prompt = prompt.format(*node_pairs)
+                if skip_edge_llm:
+                    print("[scenegraph][edge] skip LLM proposal by config skip_edge_llm=true", flush=True)
+                    relations = []
+                else:
+                    t0 = time.time()
+                    print(
+                        f"[scenegraph][edge] LLM proposal start batch {batch_start // edge_llm_batch_size + 1}",
+                        flush=True,
+                    )
+                    response_text = self.get_llm_response(prompt=prompt, timeout_s=edge_llm_timeout_s)
+                    dt = time.time() - t0
+                    if response_text is None:
+                        print(f"[scenegraph][edge] LLM proposal timeout in {dt:.2f}s (skip batch)", flush=True)
+                        continue
+                    print(f"[scenegraph][edge] LLM proposal done in {dt:.2f}s", flush=True)
+                    relations = response_text.split('\n')
+                if len(relations) == len(batch_edges):
+                    for i, relation in enumerate(relations):
+                        batch_edges[i].set_relation(relation)
             # discriminate all relation proposals
             self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
             for i, new_edge in enumerate(new_edges):
@@ -748,23 +848,56 @@ Object pair(s):
         return self.mid_term_goal
     
     def update_scenegraph(self):
-        print(f'Navigate Step: {self.navigate_steps}', end='\r')
+        print(f'Navigate Step: {self.navigate_steps}', flush=True)
+        print('[scenegraph] before segment2d', flush=True)
         self.segment2d()
+        print('[scenegraph] after segment2d', flush=True)
         if len(self.segment2d_results) > 0:
+            print('[scenegraph] before mapping3d', flush=True)
             self.mapping3d()
+            print('[scenegraph] after mapping3d', flush=True)
+            print('[scenegraph] before get_caption', flush=True)
             self.get_caption()
+            print('[scenegraph] after get_caption', flush=True)
+            print('[scenegraph] before update_node', flush=True)
             self.update_node()
+            print('[scenegraph] after update_node', flush=True)
+            print('[scenegraph] before update_edge', flush=True)
             self.update_edge()
+            print('[scenegraph] after update_edge', flush=True)
     
-    def get_llm_response(self, prompt):
-        response = ollama.chat(
-            model=self.llm_name,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-            }]
-        )
-        return response.message.content
+    def get_llm_response(self, prompt, timeout_s=None):
+        payload = {
+            "model": self.llm_name,
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+            }],
+        }
+        if timeout_s is None or timeout_s <= 0:
+            response = ollama.chat(**payload)
+            return response.message.content
+
+        result = {"done": False, "value": None, "error": None}
+
+        def _chat_worker():
+            try:
+                response = ollama.chat(**payload)
+                result["value"] = response.message.content
+            except Exception as e:
+                result["error"] = e
+            finally:
+                result["done"] = True
+
+        worker = threading.Thread(target=_chat_worker, daemon=True)
+        worker.start()
+        worker.join(timeout=timeout_s)
+        if not result["done"]:
+            return None
+        if result["error"] is not None:
+            print(f"[scenegraph][edge] LLM proposal error: {result['error']}", flush=True)
+            return None
+        return result["value"]
     
     def get_vlm_response(self, prompt, image):
         buffered = BytesIO()
@@ -817,7 +950,7 @@ Object pair(s):
             score_1 = np.clip(1-(1-self.agent.prob_array_room)-(1-whether_near_room), 0, 10)
             score_2 = 1- np.clip(self.agent.prob_array_room+(1-whether_near_room), -10,1)
             scores[i] = np.sum(score_1) - np.sum(score_2)
-        for i in range(21):
+        for i in range(len(CANONICAL_MP3D_GOAL_ORDER)):
             num_obj = len(self.agent.obj_locations[i])
             if num_obj <= 0:
                 continue
@@ -874,7 +1007,9 @@ Object pair(s):
         
     def perception(self):
         if not self.agent.found_goal:
-            self.agent.detect_objects(self.observations)
+            # act() already runs detect_objects for total_steps>1; avoid double-counting goal_gps_map votes.
+            if not getattr(self.agent, "_detect_objects_done_this_act", False):
+                self.agent.detect_objects(self.observations)
             if self.agent.total_steps % 2 == 0:
                 room_detection_result = self.agent.glip_demo.inference(self.observations["rgb"][:,:,[2,1,0]], self.agent.rooms_captions)
                 self.agent.update_room_map(self.observations, room_detection_result)

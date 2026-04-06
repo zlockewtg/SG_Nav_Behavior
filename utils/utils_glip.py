@@ -1,7 +1,10 @@
 import csv
+import copy
 import gzip
 import json
-import copy
+import os
+import re
+from pathlib import Path
 
 # GLIP prompt
 categories = [] # categories except doors 
@@ -27,16 +30,91 @@ with open('tools/matterport_category_mappings.tsv') as file:
 categories_21 = ['chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
 'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool',
 'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace', 'gym_equipment', 'seating', 'clothes']
+# categories_21 = ['chair', 'table', 'picture',  'sofa',
+# 'bed',  'plant', 'sink', 'toilet',   'clothes','camera']
 
 categories_21_origin = copy.deepcopy(categories_21)
 
 
-categories_21.append('heater')
+# categories_21.append('heater')
 categories_21.append('window')
-categories_21.append('treadmill')
-categories_21.append('exercise machine')
+categories_21.append('radio')
+categories_21.append('vidalia onion')
+categories_21.append('parer')
+categories_21.append('bowl')
+# categories_21.append('treadmill')
+# categories_21.append('exercise machine')
 object_captions = '. '.join(categories_21) +'.'# version 1
 rooms = ['bedroom', 'living room', 'bathroom', 'kitchen', 'dining room', 'office room', 'gym', 'lounge', 'laundry room']
+
+
+def _mp3d_category_word_set() -> set[str]:
+    """Lowercase tokens to avoid duplicating MP3D phrases when appending goal-specific GLIP prompts."""
+    s: set[str] = set()
+    for c in categories_21:
+        s.add(c.lower())
+        s.add(c.lower().replace("_", " "))
+        for part in c.lower().split("_"):
+            if len(part) >= 3:
+                s.add(part)
+    return s
+
+
+_MP3D_CATEGORY_WORDS = _mp3d_category_word_set()
+
+
+def extract_tokens_for_glip_from_goal_sg(goal_sg: str, max_tokens: int = 8) -> list[str]:
+    """
+    Pull open-vocab style words from obj_goal_sg (e.g. radio, receiver) for GLIP caption extension.
+    Skips tokens that are already MP3D category names (so we do not repeat cabinet, chair, ...).
+    """
+    if not goal_sg or not str(goal_sg).strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"[a-zA-Z][a-zA-Z0-9_\-]{2,}", str(goal_sg)):
+        w = m.group(0)
+        low = w.lower().rstrip("_")
+        if low in seen:
+            continue
+        if low in _MP3D_CATEGORY_WORDS:
+            continue
+        seen.add(low)
+        out.append(w)
+        if len(out) >= max_tokens:
+            break
+    return out
+
+
+def compose_glip_object_caption(base_caption: str, extra_phrases: list[str]) -> str:
+    """
+    GLIP grounding string: ``phrase1. phrase2. ...``.
+    Appends @extra_phrases if not already present (case-insensitive).
+    """
+    if not extra_phrases:
+        return base_caption
+    seen: set[str] = set()
+    chunks: list[str] = []
+    stem = base_caption.strip()
+    if stem.endswith("."):
+        stem = stem[:-1]
+    for part in stem.split("."):
+        p = part.strip()
+        if not p:
+            continue
+        seen.add(p.lower())
+        chunks.append(p)
+    for phrase in extra_phrases:
+        q = str(phrase).strip()
+        if not q:
+            continue
+        if q.lower() in seen:
+            continue
+        seen.add(q.lower())
+        chunks.append(q)
+    return ". ".join(chunks) + "."
+
+
 rooms_captions = '. '.join(rooms)+'.'
 door_captions = 'doorway. hallway.'# v2
 # object_captions = '. '.join(categories_21)+'.' # + '. wall. door.'
@@ -47,16 +125,51 @@ door_captions = 'doorway. hallway.'# v2
 # LLM reasoning prompt
 # room_prompt = "In which room will you most likely to find a "
 
-with gzip.open("tools/val.json.gz", 'r') as fin:        # 4. gzip
-    json_bytes = fin.read()                      # 3. bytes (i.e. UTF-8)
+# Must match row order of ``tools/obj.npy`` (21,) and ``tools/room.npy`` (21, 9).
+CANONICAL_MP3D_GOAL_ORDER = (
+    "chair",
+    "table",
+    "picture",
+    "cabinet",
+    "cushion",
+    "sofa",
+    "bed",
+    "chest_of_drawers",
+    "plant",
+    "sink",
+    "toilet",
+    "stool",
+    "towel",
+    "tv_monitor",
+    "shower",
+    "bathtub",
+    "counter",
+    "fireplace",
+    "gym_equipment",
+    "seating",
+    "clothes",
+)
 
-json_str = json_bytes.decode('utf-8')            # 2. string (i.e. JSON)
-data = json.loads(json_str)
 
-projection_reverse = data['category_to_task_category_id']
-projection = {}
-for key, item in projection_reverse.items():
-    projection[item] = key
+def _load_projection_from_val_json(path: Path):
+    with gzip.open(path, "r") as fin:
+        data = json.loads(fin.read().decode("utf-8"))
+    projection_reverse = data["category_to_task_category_id"]
+    projection: dict = {}
+    for key, item in projection_reverse.items():
+        projection[item] = key
+    return projection, projection_reverse
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_VAL_JSON_PATH = _REPO_ROOT / "tools" / "val.json.gz"
+_SKIP_VAL_JSON = os.environ.get("SG_NAV_SKIP_VAL_JSON", "").strip().lower() in ("1", "true", "yes")
+
+if _SKIP_VAL_JSON or not _VAL_JSON_PATH.is_file():
+    projection = {i: CANONICAL_MP3D_GOAL_ORDER[i] for i in range(len(CANONICAL_MP3D_GOAL_ORDER))}
+    projection_reverse = {}
+else:
+    projection, projection_reverse = _load_projection_from_val_json(_VAL_JSON_PATH)
 
 def get_iou(bb1, bb2):
     """

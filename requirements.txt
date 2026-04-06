@@ -13,3 +13,5 @@ inflect
 einops
 prettytable
 ftfy
+# PyTorch 1.9: timm>=1.0 needs torch.fx; pin for GLIP + old torch
+timm==0.6.12

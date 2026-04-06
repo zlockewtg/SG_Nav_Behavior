@@ -127,6 +127,12 @@ class HabitatSimV1ActionSpaceConfiguration(
                 "look_down",
                 habitat_sim.ActuationSpec(amount=self.config.TILT_ANGLE),
             ),
+            # Registered in HabitatSimActions but omitted from v0/v1 previously; task
+            # configs that list TURN_RIGHT_2 (e.g. challenge yamls) require this spec.
+            HabitatSimActions.TURN_RIGHT_2: habitat_sim.ActionSpec(
+                "turn_right",
+                habitat_sim.ActuationSpec(amount=self.config.TURN_ANGLE),
+            ),
         }
 
         config.update(new_config)
