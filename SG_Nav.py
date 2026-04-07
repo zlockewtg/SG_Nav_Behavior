@@ -34,7 +34,7 @@ from utils.image_process import (
     add_rectangle,
     add_text,
     add_text_list,
-    crop_around_point,
+    compute_crop_rect,
     draw_agent,
     draw_goal,
     line_list,
@@ -405,6 +405,11 @@ class SG_Nav_Agent():
         self._log_coordinate_assumptions = bool(_runtime_get("log_coordinate_assumptions", True))
         # Per-step depth/map/traversible stats for diagnosing "all light gray" panel cases.
         self._log_mapping_stats = bool(_runtime_get("log_mapping_stats", True))
+        # Map write diagnostics:
+        # - full_map_delta: how many obstacle cells are newly added/removed each step.
+        # - collision_paint: cells painted by forward-collision heuristic in _plan.
+        self._log_full_map_delta = bool(_runtime_get("log_full_map_delta", True))
+        self._log_collision_paint = bool(_runtime_get("log_collision_paint", True))
         # Structured health checks for depth/map/camera; parse [SG-Nav][check] lines while running.
         self._log_runtime_checks = bool(_runtime_get("log_runtime_checks", True))
         self._check_traversible_free_warn = float(_runtime_get("check_traversible_free_warn", 0.95))
@@ -496,6 +501,9 @@ class SG_Nav_Agent():
         full_nonzero = float(np.mean(np.abs(fm) > 1e-6))
         coll = np.asarray(self.collision_map)
         coll_occ = float(np.mean(coll > 0.5)) if coll.size else float("nan")
+        fb = self.fbe_free_map[0, 0].detach().cpu().numpy()
+        free_map_occ = float(np.mean(fb > float(self._traversible_free_map_min)))
+        free_map_nonzero = float(np.mean(np.abs(fb) > 1e-6))
 
         tr_free = float("nan")
         tr_obs = float("nan")
@@ -513,7 +521,9 @@ class SG_Nav_Agent():
             f"depth[min,max,med_pos]=[{dmin:.3f},{dmax:.3f},{dmed:.3f}] "
             f"depth_zero_frac={dnear_min:.3f} "
             f"full_map_occ={full_occ:.3f} full_map_nonzero={full_nonzero:.3f} "
-            f"collision_occ={coll_occ:.3f} traversible_free={tr_free:.3f} traversible_obs={tr_obs:.3f}",
+            f"collision_occ={coll_occ:.3f} "
+            f"free_map_occ={free_map_occ:.3f} free_map_nonzero={free_map_nonzero:.3f} "
+            f"traversible_free={tr_free:.3f} traversible_obs={tr_obs:.3f}",
             flush=True,
         )
         self._log_runtime_check_flags(
@@ -1523,7 +1533,8 @@ class SG_Nav_Agent():
                 y_0 = max(goal_y[0] - 8, 0)
                 x_1 = min(goal_x[0] + 8, self.map_size)
                 y_1 = min(goal_y[0] + 8, self.map_size)
-                self.fbe_free_map[x_0:x_1, y_0:y_1] = 0
+                # fbe_free_map is [1,1,H,W]; clear on the 2D map plane.
+                self.fbe_free_map[0, 0, x_0:x_1, y_0:y_1] = 0
             self.goal_loc = self.fbe(traversible, cur_start)
             self.not_use_random_goal()
             self.goal_map = np.zeros(self.full_map.shape[-2:])
@@ -1792,7 +1803,54 @@ class SG_Nav_Agent():
         self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
         self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
         self._clamp_full_pose_xy_to_map_meters()
+        fm_prev = None
+        if getattr(self, "_log_full_map_delta", False):
+            fm_prev = self.full_map[0, 0].detach().cpu().numpy().copy()
         self.full_map = self.sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.full_map)
+        if fm_prev is not None:
+            fm_now = self.full_map[0, 0].detach().cpu().numpy()
+            occ_thr = float(self._traversible_occ_from_depth_min)
+            prev_occ = fm_prev > occ_thr
+            now_occ = fm_now > occ_thr
+            add_occ = np.logical_and(np.logical_not(prev_occ), now_occ)
+            del_occ = np.logical_and(prev_occ, np.logical_not(now_occ))
+            add_ratio = float(np.mean(add_occ))
+            del_ratio = float(np.mean(del_occ))
+
+            h, w = int(now_occ.shape[0]), int(now_occ.shape[1])
+            px = float(self.full_pose[0].detach().cpu().item())
+            py = float(self.full_pose[1].detach().cpu().item())
+            sy = int(round((float(self.map_size_cm) / 100.0 - py) * 100.0 / float(self.map_resolution)))
+            sx = int(round(px * 100.0 / float(self.map_resolution)))
+            sy = max(0, min(h - 1, sy))
+            sx = max(0, min(w - 1, sx))
+            win = 40
+            y0 = max(0, sy - win)
+            y1 = min(h, sy + win + 1)
+            x0 = max(0, sx - win)
+            x1 = min(w, sx + win + 1)
+            if y1 > y0 and x1 > x0:
+                add_local = float(np.mean(add_occ[y0:y1, x0:x1]))
+                occ_local = float(np.mean(now_occ[y0:y1, x0:x1]))
+            else:
+                add_local = float("nan")
+                occ_local = float("nan")
+            yy, xx = np.ogrid[:h, :w]
+            rr2 = (yy - sy) ** 2 + (xx - sx) ** 2
+            near = rr2 <= (12 ** 2)
+            ring = np.logical_and(rr2 >= (4 ** 2), rr2 <= (10 ** 2))
+            add_near = float(np.mean(np.logical_and(add_occ, near)))
+            add_ring = float(np.mean(np.logical_and(add_occ, ring)))
+            print(
+                "[SG-Nav][full_map_delta] "
+                f"step={self.total_steps} occ_thr={occ_thr:.3f} "
+                f"prev_occ={float(np.mean(prev_occ)):.3f} now_occ={float(np.mean(now_occ)):.3f} "
+                f"add_occ={add_ratio:.4f} del_occ={del_ratio:.4f} "
+                f"local_occ={occ_local:.3f} local_add={add_local:.4f} "
+                f"add_near={add_near:.4f} add_ring={add_ring:.4f} "
+                f"start_ij=({sy},{sx})",
+                flush=True,
+            )
         # collision_map was a one-time numpy slice at init; full_map is a new tensor each step.
         # Reseed from current depth map first (depth-only path), then optionally fuse OG occupancy.
         if self._og_occ_reseed:
@@ -1878,7 +1936,19 @@ class SG_Nav_Agent():
         self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
         self._clamp_full_pose_xy_to_map_meters()
         self.fbe_free_map = self.free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.fbe_free_map)
-        self.fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1
+        # Keep a tiny free seed at the current robot cell on the actual map plane.
+        h, w = int(self.fbe_free_map.shape[-2]), int(self.fbe_free_map.shape[-1])
+        px = float(self.full_pose[0].detach().cpu().item())
+        py = float(self.full_pose[1].detach().cpu().item())
+        sy = int(round((float(self.map_size_cm) / 100.0 - py) * 100.0 / float(self.map_resolution)))
+        sx = int(round(px * 100.0 / float(self.map_resolution)))
+        sy = max(0, min(h - 1, sy))
+        sx = max(0, min(w - 1, sx))
+        y0 = max(0, sy - 3)
+        y1 = min(h, sy + 4)
+        x0 = max(0, sx - 3)
+        x1 = min(w, sx + 4)
+        self.fbe_free_map[0, 0, y0:y1, x0:x1] = 1
     
     def update_room_map(self, observations, room_prediction_result):
         new_room_labels = self.get_glip_real_label(room_prediction_result)
@@ -2019,6 +2089,59 @@ class SG_Nav_Agent():
         obs_from_depth = self._apply_map_frame_transform(obs_from_depth_raw, frame_mode)
         obs_from_collision = self._apply_map_frame_transform(obs_from_collision_raw, frame_mode)
         free_from_depth = self._apply_map_frame_transform(free_from_depth_raw, frame_mode)
+
+        if getattr(self, "_log_mapping_stats", False):
+            h, w = int(obs_from_depth_raw.shape[0]), int(obs_from_depth_raw.shape[1])
+            sy_raw = int(np.clip(int(start[0]), 0, h - 1))
+            sx_raw = int(np.clip(int(start[1]), 0, w - 1))
+            sy_tf, sx_tf = self._transform_rc_by_frame_mode(sy_raw, sx_raw, h, w, frame_mode)
+
+            def _local_ratio(arr, cy, cx, win=40):
+                y0 = max(0, int(cy) - win)
+                y1 = min(arr.shape[0], int(cy) + win + 1)
+                x0 = max(0, int(cx) - win)
+                x1 = min(arr.shape[1], int(cx) + win + 1)
+                if y1 <= y0 or x1 <= x0:
+                    return float("nan")
+                return float(np.mean(arr[y0:y1, x0:x1]))
+
+            obs_union_raw = np.logical_or(obs_from_depth_raw, obs_from_collision_raw)
+            obs_union_tf = np.logical_or(obs_from_depth, obs_from_collision)
+            free_on_obs = float(np.mean(np.logical_and(free_from_depth_raw, obs_union_raw)))
+            free_non_obs = float(np.mean(np.logical_and(free_from_depth_raw, np.logical_not(obs_union_raw))))
+            free_total = float(np.mean(free_from_depth_raw))
+            free_conflict_ratio = (
+                free_on_obs / max(free_total, 1e-6) if math.isfinite(free_total) else float("nan")
+            )
+
+            full_l_raw = _local_ratio(obs_from_depth_raw, sy_raw, sx_raw)
+            coll_l_raw = _local_ratio(obs_from_collision_raw, sy_raw, sx_raw)
+            free_l_raw = _local_ratio(free_from_depth_raw, sy_raw, sx_raw)
+            known_l_raw = _local_ratio(np.logical_or(obs_union_raw, free_from_depth_raw), sy_raw, sx_raw)
+            # Planner uses ``start`` as-is after applying frame transform to maps.
+            # So "plan" locality should be measured around start_raw on transformed maps.
+            full_l_plan = _local_ratio(obs_from_depth, sy_raw, sx_raw)
+            coll_l_plan = _local_ratio(obs_from_collision, sy_raw, sx_raw)
+            free_l_plan = _local_ratio(free_from_depth, sy_raw, sx_raw)
+            known_l_plan = _local_ratio(np.logical_or(obs_union_tf, free_from_depth), sy_raw, sx_raw)
+            # Additional sanity: transformed-start coordinates (for diagnosing accidental double-transform assumptions).
+            full_l_tf = _local_ratio(obs_from_depth, sy_tf, sx_tf)
+            coll_l_tf = _local_ratio(obs_from_collision, sy_tf, sx_tf)
+            free_l_tf = _local_ratio(free_from_depth, sy_tf, sx_tf)
+            known_l_tf = _local_ratio(np.logical_or(obs_union_tf, free_from_depth), sy_tf, sx_tf)
+            print(
+                "[SG-Nav][map_diag] "
+                f"step={self.total_steps} frame={frame_mode} "
+                f"global[full,coll,free]=[{float(np.mean(obs_from_depth_raw)):.3f},"
+                f"{float(np.mean(obs_from_collision_raw)):.3f},{free_total:.3f}] "
+                f"local_raw[full,coll,free,known]=[{full_l_raw:.3f},{coll_l_raw:.3f},{free_l_raw:.3f},{known_l_raw:.3f}] "
+                f"local_plan[full,coll,free,known]=[{full_l_plan:.3f},{coll_l_plan:.3f},{free_l_plan:.3f},{known_l_plan:.3f}] "
+                f"local_tf_start[full,coll,free,known]=[{full_l_tf:.3f},{coll_l_tf:.3f},{free_l_tf:.3f},{known_l_tf:.3f}] "
+                f"free_raw[non_obs,conflict,conflict_ratio]=[{free_non_obs:.3f},{free_on_obs:.3f},{free_conflict_ratio:.3f}] "
+                f"start_raw=({sy_raw},{sx_raw}) start_tf=({sy_tf},{sx_tf})",
+                flush=True,
+            )
+
         inter = float(np.sum(np.logical_and(obs_from_depth, obs_from_collision)))
         union = float(np.sum(np.logical_or(obs_from_depth, obs_from_collision)))
         depth_n = float(np.sum(obs_from_depth))
@@ -2311,6 +2434,8 @@ class SG_Nav_Agent():
 
             if dist < col_threshold: # Collision
                 self.former_collide += 1
+                painted = []
+                newly_marked = 0
                 for i in range(length):
                     wx = x1 + 0.05 * ((i + buf) * np.cos(np.deg2rad(t1)))
                     wy = y1 + 0.05 * ((i + buf) * np.sin(np.deg2rad(t1)))
@@ -2318,7 +2443,26 @@ class SG_Nav_Agent():
                     r = int(round(r * 100 / self.map_resolution))
                     c = int(round(c * 100 / self.map_resolution))
                     [r, c] = pu.threshold_poses([r, c], self.collision_map.shape)
+                    if self.collision_map[r, c] <= 0.5:
+                        newly_marked += 1
+                    painted.append((int(r), int(c)))
                     self.collision_map[r,c] = 1
+                if getattr(self, "_log_collision_paint", False):
+                    uniq = sorted(set(painted))
+                    if len(uniq) > 0:
+                        rs = [p[0] for p in uniq]
+                        cs = [p[1] for p in uniq]
+                        span = f"r=[{min(rs)},{max(rs)}] c=[{min(cs)},{max(cs)}]"
+                    else:
+                        span = "r=[nan,nan] c=[nan,nan]"
+                    print(
+                        "[SG-Nav][collision_paint] "
+                        f"step={self.total_steps} dist={float(dist):.4f} thr={float(col_threshold):.4f} "
+                        f"prev_action={int(self.prev_action)} former_collide={int(self.former_collide)} "
+                        f"n_samples={int(length)} n_unique={len(uniq)} n_new={int(newly_marked)} "
+                        f"{span} heading_deg={float(t1):.2f}",
+                        flush=True,
+                    )
             else:
                 self.former_collide = 0
 
@@ -2616,10 +2760,15 @@ class SG_Nav_Agent():
             ph, pw = int(occ_panel.shape[0]), int(occ_panel.shape[1])
             acx = max(0, min(pw - 1, acx))
             acy = max(0, min(ph - 1, acy))
-            occupancy_map = crop_around_point(occ_panel, (acx, acy), (150, 200))
-            # Ensure robot marker is always visible in the cropped panel center.
+            left, top, right, bottom = compute_crop_rect(
+                int(occ_panel.shape[0]), int(occ_panel.shape[1]), (acx, acy), (150, 200)
+            )
+            occupancy_map = occ_panel[top:bottom, left:right]
+            # Draw marker at the robot's true location inside the cropped panel.
             oh, ow = occupancy_map.shape[:2]
-            cv2.circle(occupancy_map, (ow // 2, oh // 2), 2, (255, 0, 0), -1)
+            marker_x = max(0, min(ow - 1, int(acx - left)))
+            marker_y = max(0, min(oh - 1, int(acy - top)))
+            cv2.circle(occupancy_map, (marker_x, marker_y), 2, (255, 0, 0), -1)
             visualize_image = np.full((450, 800, 3), 255, dtype=np.uint8)
             det_rgb = self._render_detection_overlay(self.rgb_visualization)
             visualize_image = add_resized_image(visualize_image, det_rgb, (10, 60), (320, 240))

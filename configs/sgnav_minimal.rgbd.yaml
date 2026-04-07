@@ -2,7 +2,7 @@
 # Use: OmegaConf.load / habitat.get_config — same structure Habitat tasks expect.
 
 SIMULATOR:
-  TURN_ANGLE: 30
+  TURN_ANGLE: 60
   TILT_ANGLE: 30
   FORWARD_STEP_SIZE: 0.1
   AGENT_0:
@@ -70,6 +70,11 @@ SGNAV_RUNTIME:
   # Per-step depth/map stats (depth range, full_map occupancy, collision occupancy, traversible free ratio).
   # Use this to diagnose "traversible almost all light gray" quickly from server stderr.
   log_mapping_stats: true
+  # Extra map-write diagnostics:
+  # [SG-Nav][full_map_delta]: per-step new/deleted obstacle ratios (global + robot-local).
+  # [SG-Nav][collision_paint]: cells painted by forward-collision heuristic in _plan.
+  log_full_map_delta: true
+  log_collision_paint: true
   # Structured health checks. Watch [SG-Nav][check] and only inspect flags:
   # - TRAVERSIBLE_TOO_FREE / DEPTH_TOO_MANY_ZEROS / DEPTH_MEDIAN_OUT_OF_RANGE
   # - CAMERA_ROLL_LARGE / CAMERA_PITCH_LARGE / CAMERA_HEIGHT_OUTLIER / FALL_SUSPECTED
