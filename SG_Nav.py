@@ -221,12 +221,38 @@ class SG_Nav_Agent():
         self._planner_face_goal_max_error_deg = float(
             _runtime_get("planner_face_goal_max_error_deg", -1.0)
         )
+        # Estimate the real per-step turn angle from compass deltas after TURN actions.
+        # This keeps local planning aligned with the robot's actual executed motion instead of
+        # assuming yaml TURN_ANGLE matches the low-level controller.
+        self._planner_use_observed_turn = bool(
+            _runtime_get("planner_use_observed_turn", True)
+        )
+        self._planner_observed_turn_ema_alpha = float(
+            _runtime_get("planner_observed_turn_ema_alpha", 0.35)
+        )
+        self._planner_min_effective_turn_deg = float(
+            _runtime_get("planner_min_effective_turn_deg", 1.0)
+        )
+        self._planner_forward_error_turn_ratio = float(
+            _runtime_get("planner_forward_error_turn_ratio", 0.5)
+        )
+        self._planner_observed_turn_deg = None
+        self._planner_last_turn_delta_deg = None
+        self._prev_obs_compass_rad = None
         # Steps 1..N: while no goal hint, keep returning TURN (6) for panorama. Default 22 matches original SG-Nav.
         self._panorama_spin_until_step = max(1, int(_runtime_get("panorama_spin_until_step", 22)))
         # FMM local short-term goal window (grid cells); larger → coarser STG, less twitchy. See utils_fmm/fmm_planner.py.
         self._fmm_step_size = max(1, int(_runtime_get("fmm_step_size", 5)))
         # Subgoal “close enough” threshold inside get_short_term_goal (before decrease_stop_cond scaling).
         self._fmm_stop_cond = float(_runtime_get("fmm_stop_cond", 0.5))
+        # Goal-approach stop policy once the target has been confirmed on the map:
+        # use a separate distance threshold for "stop near target" instead of the generic exploration stop_cond.
+        self._goal_stop_distance_threshold_m = float(
+            _runtime_get("goal_stop_distance_threshold_m", self._fmm_stop_cond)
+        )
+        self._goal_stop_face_threshold_deg = float(
+            _runtime_get("goal_stop_face_threshold_deg", 15.0)
+        )
         # Forward-motion collision heuristic: GPS delta below this (m) while driving → paint obstacle ahead.
         self.collision_threshold = float(_runtime_get("collision_threshold_m", 0.08))
         # Hard safety guard before issuing FORWARD:
@@ -240,7 +266,7 @@ class SG_Nav_Agent():
             _runtime_get("traversible_clear_robot_obs_enable", True)
         )
         self._traversible_clear_robot_obs_radius_m = float(
-            _runtime_get("traversible_clear_robot_obs_radius_m", 0.20)
+            _runtime_get("traversible_clear_robot_obs_radius_m", 0.30)
         )
         self._traversible_clear_robot_obs_radius_cells = max(
             0,
@@ -718,6 +744,40 @@ class SG_Nav_Agent():
         return roll, pitch, yaw
 
     @staticmethod
+    def _wrap_angle_rad_pm_pi(angle_rad: float) -> float:
+        x = float(angle_rad)
+        while x > math.pi:
+            x -= 2.0 * math.pi
+        while x < -math.pi:
+            x += 2.0 * math.pi
+        return x
+
+    def _update_observed_turn_from_compass(self, observations) -> None:
+        comp = np.asarray(observations.get("compass", [0.0]), dtype=np.float64).reshape(-1)
+        if comp.size <= 0 or not math.isfinite(float(comp[0])):
+            return
+        cur_compass_rad = float(comp[0])
+        prev_compass_rad = self._prev_obs_compass_rad
+        self._prev_obs_compass_rad = cur_compass_rad
+        if prev_compass_rad is None:
+            return
+        if int(getattr(self, "prev_action", 0)) not in (2, 3, 6):
+            return
+
+        delta_rad = self._wrap_angle_rad_pm_pi(cur_compass_rad - float(prev_compass_rad))
+        delta_deg = abs(math.degrees(delta_rad))
+        self._planner_last_turn_delta_deg = float(delta_deg)
+        if not math.isfinite(delta_deg):
+            return
+        if self._planner_observed_turn_deg is None:
+            self._planner_observed_turn_deg = float(delta_deg)
+            return
+        alpha = float(np.clip(self._planner_observed_turn_ema_alpha, 0.0, 1.0))
+        self._planner_observed_turn_deg = float(
+            (1.0 - alpha) * float(self._planner_observed_turn_deg) + alpha * float(delta_deg)
+        )
+
+    @staticmethod
     def _quat_xyzw_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
         """Rotate vector by quaternion (xyzw)."""
         n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
@@ -1010,6 +1070,9 @@ class SG_Nav_Agent():
         self.count_episodes = self.count_episodes + 1
         self.loop_time = 0
         self.last_segment_num = 0
+        self._planner_observed_turn_deg = None
+        self._planner_last_turn_delta_deg = None
+        self._prev_obs_compass_rad = None
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
         if object_category is not None:
             self.obj_goal = object_category
@@ -1394,6 +1457,7 @@ class SG_Nav_Agent():
         comp = np.asarray(observations["compass"], dtype=np.float64).reshape(-1).copy()
         comp[0] += self._compass_offset_rad
         observations["compass"] = comp
+        self._update_observed_turn_from_compass(observations)
         gps = np.asarray(observations["gps"], dtype=np.float64).reshape(-1).copy()
         if self._gps_negate_y:
             gps[1] = -gps[1]
@@ -1651,6 +1715,18 @@ class SG_Nav_Agent():
                 parts.append(
                     f"align_thr={dbg['align_thr_deg']:.1f} fwd_exit={dbg['forward_exit_deg']:.1f}"
                 )
+                if dbg.get("align_thr_cfg_deg") is not None:
+                    parts.append(
+                        f"align_cfg={dbg['align_thr_cfg_deg']:.1f} fwd_exit_cfg={dbg['forward_exit_cfg_deg']:.1f}"
+                    )
+                if dbg.get("face_goal_only_deg", -1.0) >= 0.0:
+                    parts.append(
+                        f"face_eps={dbg['face_goal_only_deg']:.1f} face_eps_cfg={dbg['face_goal_only_cfg_deg']:.1f}"
+                    )
+            if dbg.get("observed_turn_deg") is not None:
+                parts.append(f"obs_turn_deg={dbg['observed_turn_deg']:.2f}")
+            if dbg.get("last_turn_delta_deg") is not None:
+                parts.append(f"last_turn_deg={dbg['last_turn_delta_deg']:.2f}")
             parts.append(f"stg_ij={dbg.get('stg')}")
             parts.append(
                 f"start_ij={dbg.get('start_ij')} start_o_deg={dbg.get('start_o_deg', float('nan')):.2f}"
@@ -1815,6 +1891,41 @@ class SG_Nav_Agent():
         agent_compass = observations['compass']
         phi = phi_world - agent_compass
         return np.array([rho, phi.item()], dtype=np.float32)
+
+    @staticmethod
+    def _wrap_angle_deg(angle_deg):
+        angle_deg = float(angle_deg)
+        angle_deg = (angle_deg + 180.0) % 360.0 - 180.0
+        return angle_deg
+
+    def _get_goal_stop_status(self, agent_pose, goal_gps=None):
+        if goal_gps is None:
+            goal_gps = getattr(self, "goal_gps", None)
+        if goal_gps is None or len(goal_gps) < 2:
+            return None
+        try:
+            goal_x = float(goal_gps[0])
+            goal_y = float(goal_gps[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not (math.isfinite(goal_x) and math.isfinite(goal_y)):
+            return None
+
+        half_map_m = float(self.map_size_cm) / 200.0
+        agent_x = float(agent_pose[0]) - half_map_m
+        agent_y = half_map_m - float(agent_pose[1])
+        dx = goal_x - agent_x
+        dy = goal_y - agent_y
+        rho = math.hypot(dx, dy)
+        bearing_deg = math.degrees(math.atan2(dy, dx))
+        heading_deg = float(agent_pose[2])
+        heading_error_deg = self._wrap_angle_deg(bearing_deg - heading_deg)
+        return {
+            "distance_m": float(rho),
+            "bearing_deg": float(bearing_deg),
+            "heading_deg": float(heading_deg),
+            "heading_error_deg": float(heading_error_deg),
+        }
    
     def init_map(self):
         self.map_size = self.map_size_cm // self.map_resolution
@@ -1824,6 +1935,7 @@ class SG_Nav_Agent():
         self.visited = self.full_map[0,0].cpu().numpy()
         self.collision_map = self.full_map[0,0].cpu().numpy()
         self.fbe_free_map = copy.deepcopy(self.full_map).to(self.device) # 0 is unknown, 1 is free
+        self.default_free_map = np.zeros((full_w, full_h), dtype=np.float32)
         self.full_pose = torch.zeros(3).float().to(self.device)
         self.goal_gps_map = self.full_map[0,0].cpu().numpy()
         self.origins = np.zeros((2))
@@ -1905,26 +2017,25 @@ class SG_Nav_Agent():
         self._clear_collision_near_robot()
 
     def _clear_collision_near_robot(self):
-        if not bool(getattr(self, "_traversible_clear_robot_obs_enable", False)):
-            return
-        radius_cells = int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0))
-        if radius_cells <= 0:
-            return
-        coll = np.asarray(self.collision_map)
-        if coll.ndim != 2 or coll.size == 0:
-            return
-        h, w = coll.shape
+        # Robot-local prior free support is handled via ``default_free_map`` / ``fbe_free_map``.
+        # Do not clear current obstacle evidence here: observed depth/collision must override the prior.
+        return
+
+    def _robot_map_rc_from_full_pose(self, h: int, w: int) -> tuple[int, int]:
         px = float(self.full_pose[0].detach().cpu().item())
         py = float(self.full_pose[1].detach().cpu().item())
-        # Match ``get_traversible`` start convention.
         sy = int(round((float(self.map_size_cm) / 100.0 - py) * 100.0 / float(self.map_resolution)))
         sx = int(round(px * 100.0 / float(self.map_resolution)))
-        sy = max(0, min(h - 1, sy))
-        sx = max(0, min(w - 1, sx))
-        yy, xx = np.ogrid[:h, :w]
-        local = ((yy - sy) ** 2 + (xx - sx) ** 2) <= (radius_cells ** 2)
-        coll[local] = 0.0
-        self.collision_map = coll
+        sy = max(0, min(int(h) - 1, sy))
+        sx = max(0, min(int(w) - 1, sx))
+        return sy, sx
+
+    @staticmethod
+    def _disk_mask_for_center(h: int, w: int, cy: int, cx: int, radius_cells: int):
+        if int(radius_cells) <= 0:
+            return np.zeros((int(h), int(w)), dtype=bool)
+        yy, xx = np.ogrid[: int(h), : int(w)]
+        return ((yy - int(cy)) ** 2 + (xx - int(cx)) ** 2) <= (int(radius_cells) ** 2)
 
     def _fuse_og_occupancy_into_collision(self, observations):
         """
@@ -1981,19 +2092,22 @@ class SG_Nav_Agent():
         self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
         self._clamp_full_pose_xy_to_map_meters()
         self.fbe_free_map = self.free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.fbe_free_map)
-        # Keep a tiny free seed at the current robot cell on the actual map plane.
         h, w = int(self.fbe_free_map.shape[-2]), int(self.fbe_free_map.shape[-1])
-        px = float(self.full_pose[0].detach().cpu().item())
-        py = float(self.full_pose[1].detach().cpu().item())
-        sy = int(round((float(self.map_size_cm) / 100.0 - py) * 100.0 / float(self.map_resolution)))
-        sx = int(round(px * 100.0 / float(self.map_resolution)))
-        sy = max(0, min(h - 1, sy))
-        sx = max(0, min(w - 1, sx))
-        y0 = max(0, sy - 3)
-        y1 = min(h, sy + 4)
-        x0 = max(0, sx - 3)
-        x1 = min(w, sx + 4)
-        self.fbe_free_map[0, 0, y0:y1, x0:x1] = 1
+        sy, sx = self._robot_map_rc_from_full_pose(h, w)
+        radius_cells = int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0))
+        obs_map = self.full_map[0, 0].detach().cpu().numpy() > float(self._traversible_occ_from_depth_min)
+        coll_map = np.asarray(self.collision_map, dtype=np.float32) > 0.5
+        obs_or_coll = np.logical_or(obs_map, coll_map)
+        if np.any(obs_or_coll):
+            obs_or_coll_t = torch.from_numpy(obs_or_coll).to(self.device)
+            self.fbe_free_map[0, 0][obs_or_coll_t] = 0.0
+        default_free = self._disk_mask_for_center(h, w, sy, sx, radius_cells)
+        default_free = np.logical_and(default_free, np.logical_not(obs_or_coll))
+        self.default_free_map.fill(0.0)
+        self.default_free_map[default_free] = 1.0
+        if np.any(default_free):
+            default_free_t = torch.from_numpy(default_free).to(self.device)
+            self.fbe_free_map[0, 0][default_free_t] = 1.0
     
     def update_room_map(self, observations, room_prediction_result):
         new_room_labels = self.get_glip_real_label(room_prediction_result)
@@ -2351,13 +2465,11 @@ class SG_Nav_Agent():
             bool(getattr(self, "_traversible_clear_robot_obs_enable", False))
             and int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0)) > 0
         ):
-            radius_cells = int(self._traversible_clear_robot_obs_radius_cells)
-            yy, xx = np.ogrid[: obs_from_depth.shape[0], : obs_from_depth.shape[1]]
-            robot_local = ((yy - sy_plan) ** 2 + (xx - sx_plan) ** 2) <= (radius_cells ** 2)
-            obs_from_depth[robot_local] = False
-            obs_from_collision[robot_local] = False
-            # Keep local support for explored-only traversible at the robot footprint.
-            free_from_depth[robot_local] = True
+            default_free_raw = np.asarray(
+                self.default_free_map[gy1:gy2, gx1:gx2][y1:y2, x1:x2], dtype=np.float32
+            ) > 0.5
+            robot_local = self._apply_map_frame_transform(default_free_raw, frame_mode)
+            free_from_depth = np.logical_or(free_from_depth, robot_local)
         border_cells = int(getattr(self, "_traversible_clear_border_obs_cells", 0))
         if border_cells > 0:
             b = int(min(border_cells, (h - 1) // 2, (w - 1) // 2))
@@ -2446,9 +2558,6 @@ class SG_Nav_Agent():
         selem = skimage.morphology.disk(int(self._traversible_obstacle_inflation_cells))
         obs_core = np.logical_or(obs_from_depth, obs_from_collision)
         obs_dilated = skimage.morphology.binary_dilation(obs_core, selem)
-        # Enforce local clear area after inflation too; otherwise dilation can re-cover the robot neighborhood.
-        if robot_local is not None:
-            obs_dilated[robot_local] = False
 
         if self._traversible_require_explored:
             traversible = np.logical_and(free_from_depth, np.logical_not(obs_dilated))
@@ -2679,6 +2788,8 @@ class SG_Nav_Agent():
                 self.former_collide = 0
 
         stg, replan, stop, = self._get_stg(traversible, start, np.copy(goal_map), goal_found)
+        goal_stop_state = self._get_goal_stop_status(agent_pose) if goal_found else None
+        goal_stop_override = False
 
         # Deterministic Local Policy
         if stop:
@@ -2690,6 +2801,8 @@ class SG_Nav_Agent():
                     "stg": (int(stg_y), int(stg_x)),
                     "start_ij": (int(start[0]), int(start[1])),
                     "start_o_deg": float(start_o),
+                    "observed_turn_deg": None if getattr(self, "_planner_observed_turn_deg", None) is None else float(self._planner_observed_turn_deg),
+                    "last_turn_delta_deg": None if getattr(self, "_planner_last_turn_delta_deg", None) is None else float(self._planner_last_turn_delta_deg),
                     "replan": bool(replan),
                     "action": int(action),
                 }
@@ -2710,6 +2823,38 @@ class SG_Nav_Agent():
             forward_exit = max(0.0, align_thr - hys)
             face_eps = float(getattr(self, "_planner_face_goal_max_error_deg", -1.0))
             use_strict_face_goal = face_eps >= 0.0
+            observed_turn_deg = None
+            if bool(getattr(self, "_planner_use_observed_turn", False)):
+                obs_turn = getattr(self, "_planner_observed_turn_deg", None)
+                if obs_turn is not None and math.isfinite(float(obs_turn)):
+                    observed_turn_deg = max(
+                        float(getattr(self, "_planner_min_effective_turn_deg", 1.0)),
+                        abs(float(obs_turn)),
+                    )
+            align_thr_cfg = float(align_thr)
+            forward_exit_cfg = float(forward_exit)
+            face_eps_cfg = float(face_eps)
+            if observed_turn_deg is not None:
+                ratio = max(
+                    0.0,
+                    float(getattr(self, "_planner_forward_error_turn_ratio", 0.5)),
+                )
+                align_thr = min(float(align_thr), float(observed_turn_deg))
+                forward_exit = min(
+                    float(forward_exit),
+                    max(
+                        float(getattr(self, "_planner_min_effective_turn_deg", 1.0)),
+                        float(observed_turn_deg) * ratio,
+                    ),
+                )
+                if use_strict_face_goal:
+                    face_eps = min(
+                        float(face_eps),
+                        max(
+                            float(getattr(self, "_planner_min_effective_turn_deg", 1.0)),
+                            float(observed_turn_deg) * ratio,
+                        ),
+                    )
 
             if use_strict_face_goal:
                 # Face STG before driving: forward only inside a tight angular window.
@@ -2808,8 +2953,13 @@ class SG_Nav_Agent():
                     "angle_agent_deg": float(angle_agent),
                     "relative_angle_deg": float(relative_angle),
                     "align_thr_deg": float(align_thr),
+                    "align_thr_cfg_deg": float(align_thr_cfg),
                     "forward_exit_deg": float(forward_exit),
+                    "forward_exit_cfg_deg": float(forward_exit_cfg),
                     "face_goal_only_deg": float(face_eps) if use_strict_face_goal else -1.0,
+                    "face_goal_only_cfg_deg": float(face_eps_cfg) if use_strict_face_goal else -1.0,
+                    "observed_turn_deg": None if observed_turn_deg is None else float(observed_turn_deg),
+                    "last_turn_delta_deg": None if getattr(self, "_planner_last_turn_delta_deg", None) is None else float(self._planner_last_turn_delta_deg),
                     "prev_action": int(self.prev_action),
                     "former_collide": int(self.former_collide),
                     "replan": bool(replan),
@@ -2819,6 +2969,43 @@ class SG_Nav_Agent():
                 }
                 if fg_info is not None:
                     self._last_planner_debug["forward_guard_info"] = fg_info
+
+        if (
+            goal_found
+            and goal_stop_state is not None
+            and goal_stop_state["distance_m"] <= float(self._goal_stop_distance_threshold_m)
+        ):
+            goal_stop_override = True
+            if (
+                goal_stop_state["distance_m"] <= 1e-3
+                or abs(goal_stop_state["heading_error_deg"])
+                <= float(self._goal_stop_face_threshold_deg)
+            ):
+                action = 0
+            elif goal_stop_state["heading_error_deg"] > 0:
+                action = 2
+            else:
+                action = 3
+
+            if getattr(self, "_log_pose_align_trace", False):
+                if not isinstance(getattr(self, "_last_planner_debug", None), dict):
+                    self._last_planner_debug = {}
+                self._last_planner_debug.update(
+                    {
+                        "goal_stop_override": True,
+                        "goal_stop_distance_m": float(goal_stop_state["distance_m"]),
+                        "goal_stop_heading_error_deg": float(
+                            goal_stop_state["heading_error_deg"]
+                        ),
+                        "goal_stop_distance_thr_m": float(
+                            self._goal_stop_distance_threshold_m
+                        ),
+                        "goal_stop_face_thr_deg": float(
+                            self._goal_stop_face_threshold_deg
+                        ),
+                        "action": int(action),
+                    }
+                )
 
         return stg_y, stg_x, replan, action
     
@@ -2837,7 +3024,12 @@ class SG_Nav_Agent():
             goal, centers = CH._get_center_goal(goal)
         state = [start[0] + 1, start[1] + 1]
         self.planner = FMMPlanner(traversible, None, step_size=self._fmm_step_size)
-        self.planner.stop_cond = self._fmm_stop_cond
+        if goal_found:
+            self.planner.stop_cond = max(
+                0.05, float(self._goal_stop_distance_threshold_m)
+            )
+        else:
+            self.planner.stop_cond = self._fmm_stop_cond
 
         if self.dilation_deg!=0: 
             goal = CH._add_cross_dilation(goal, self.dilation_deg, 3)
@@ -2944,8 +3136,13 @@ class SG_Nav_Agent():
                 plan_cy = max(0, min(h - 1, int(cy_pose_plan)))
                 center_src = "pose_history_transform"
             obs_mask = obs_mask_0
-            shown_free = shown_free_0
-            unknown_mask = np.logical_and(~obs_mask, ~shown_free)
+            radius_cells = int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0))
+            default_free_mask = self._disk_mask_for_center(h, w, plan_cy, plan_cx, radius_cells)
+            default_free_mask = np.logical_and(default_free_mask, np.logical_not(obs_mask))
+            shown_default_free = default_free_mask
+            shown_free = np.logical_and(shown_free_0, np.logical_not(shown_default_free))
+            shown_free_total = np.logical_or(shown_free, shown_default_free)
+            unknown_mask = np.logical_and(~obs_mask, ~shown_free_total)
 
             def _known_score(cy, cx, win=20):
                 y0 = max(0, int(cy) - win)
@@ -2954,7 +3151,13 @@ class SG_Nav_Agent():
                 x1 = min(w, int(cx) + win + 1)
                 if y1 <= y0 or x1 <= x0:
                     return 0.0
-                return float(np.mean(np.logical_or(obs_mask[y0:y1, x0:x1], shown_free[y0:y1, x0:x1])))
+                return float(
+                    np.mean(
+                        np.logical_or(
+                            obs_mask[y0:y1, x0:x1], shown_free_total[y0:y1, x0:x1]
+                        )
+                    )
+                )
 
             known_raw_ref = _known_score(raw_cy, raw_cx)
             known_plan = _known_score(plan_cy, plan_cx)
@@ -2970,12 +3173,13 @@ class SG_Nav_Agent():
                 if tr.shape == obs_mask.shape:
                     tr_free = tr > 0.5
                     shown_free = np.logical_or(shown_free, np.logical_and(tr_free, ~obs_mask))
-                    unknown_mask = np.logical_and(~obs_mask, ~shown_free)
+                    shown_free_total = np.logical_or(shown_free, shown_default_free)
+                    unknown_mask = np.logical_and(~obs_mask, ~shown_free_total)
 
             print(
                 "[SG-Nav][viz_occ] "
                 f"step={self.total_steps} frame={frame_mode} "
-                f"obs={float(np.mean(obs_mask)):.3f} free={float(np.mean(shown_free)):.3f} "
+                f"obs={float(np.mean(obs_mask)):.3f} free={float(np.mean(shown_free_total)):.3f} "
                 f"unk={float(np.mean(unknown_mask)):.3f} "
                 f"crop_center={crop_center_mode} "
                 f"known_plan={known_plan:.3f} known_raw_ref={known_raw_ref:.3f} "
@@ -2986,10 +3190,12 @@ class SG_Nav_Agent():
 
             unknown_rgb = np.array(colors.to_rgb("#FFFFFF"), dtype=np.float64)
             free_rgb = np.array(colors.to_rgb("#E7E7E7"), dtype=np.float64)
+            default_free_rgb = np.array(colors.to_rgb("#D6D6D6"), dtype=np.float64)
             obstacle_rgb = np.array(colors.to_rgb("#A2A2A2"), dtype=np.float64)
             panel_hw3 = np.tile(unknown_rgb, (h, w, 1))
             panel_hw3[unknown_mask] = unknown_rgb
             panel_hw3[shown_free] = free_rgb
+            panel_hw3[shown_default_free] = default_free_rgb
             panel_hw3[obs_mask] = obstacle_rgb
             paper_map_trans = torch.from_numpy(panel_hw3).permute(2, 0, 1).double()
             self.visualize_agent_and_goal(paper_map_trans)
@@ -3003,7 +3209,7 @@ class SG_Nav_Agent():
             src_left = int(acx - half_w)
             src_bottom = src_top + crop_h
             src_right = src_left + crop_w
-            # Keep robot centered in the occupancy panel even near global-map borders.
+            # Keep the robot centered in the occupancy panel even near global-map borders.
             occupancy_map = np.full((crop_h, crop_w, 3), 255, dtype=np.uint8)
             copy_top = max(0, src_top)
             copy_left = max(0, src_left)
@@ -3017,7 +3223,6 @@ class SG_Nav_Agent():
                 occupancy_map[dst_top:dst_bottom, dst_left:dst_right] = occ_panel[
                     copy_top:copy_bottom, copy_left:copy_right
                 ]
-            # Draw marker at center of padded crop (robot-centered panel).
             marker_x = int(half_w)
             marker_y = int(half_h)
             cv2.circle(occupancy_map, (marker_x, marker_y), 2, (255, 0, 0), -1)

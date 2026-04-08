@@ -4,7 +4,7 @@
 SIMULATOR:
   TURN_ANGLE: 60
   TILT_ANGLE: 30
-  FORWARD_STEP_SIZE: 0.1
+  FORWARD_STEP_SIZE: 0.5
   AGENT_0:
     HEIGHT: 0.88
     RADIUS: 0.18
@@ -121,7 +121,10 @@ SGNAV_RUNTIME:
   # full_map obstacle threshold (0..1): lower catches thinner obstacles; higher is more conservative.
   traversible_occ_from_depth_min: 0.35
   # If true, unknown cells are non-traversible unless marked free by fbe_free_map.
-  traversible_require_explored: true
+  traversible_require_explored: false
+  # Robot-local prior free disk: clear a small neighborhood around the robot and seed it into free_map.
+  traversible_clear_robot_obs_enable: true
+  traversible_clear_robot_obs_radius_m: 1
   # Traversible frame in SG-Nav get_traversible (fixed to avoid step-wise frame switching).
   map_frame_auto_select: false
   map_frame_fixed_mode: flipud
@@ -150,13 +153,18 @@ SGNAV_RUNTIME:
   planner_align_hysteresis_deg: 10.0
   # FMM local policy: only FORWARD when |heading − STG bearing| ≤ this (deg); otherwise turn in place toward STG.
   # -1 disables (uses planner_align_angle_deg / hysteresis wide cone). Smaller → stricter “always face goal before driving”.
-  planner_face_goal_max_error_deg: 10.0
+  planner_face_goal_max_error_deg: 30.0
   # While no goal hint, keep issuing TURN (action 6) until this step (default 22). Lower = end panorama earlier.
   panorama_spin_until_step: 22
   # FMM short-term goal: local patch half-width in grid cells (default 5). Larger → coarser STG, less jitter.
   fmm_step_size: 5
   # FMM subgoal “close enough” threshold (fmm_planner.stop_cond); lower → more steps before stop=True at STG.
   fmm_stop_cond: 1
+  # Confirmed target approach: once found_goal=True, use this distance (m) as the terminal standoff threshold.
+  # The agent keeps path-planning toward the target, then stops only after it is both within this distance and facing it.
+  goal_stop_distance_threshold_m: 1.0
+  # Confirmed target approach: final heading error tolerance (deg) before STOP.
+  goal_stop_face_threshold_deg: 12.0
   # When GLIP matches the goal bbox, print goal_gps_map vote_max vs obj_min_detections (stderr).
   log_goal_votes: true
   # Per-step planner line: goal_map_src, found_goal / found_possible_goal, replan_fbe, stuck_reset, action.
@@ -172,6 +180,7 @@ SGNAV_RUNTIME:
   # After get_traversible each act(): PNGs full_map[0,0], collision, visited,
   # traversible_with_boundary, traversible_core (1:-1 strip). Omit or empty = off.
   # nav_grid_dump_dir: data/visualization/experiment_0/nav_grids
+  # Detection voting radius: bbox depth >= this is treated as a far hint / possible goal, not the final stop distance.
   goal_distance_threshold: 8.0
   show_frame_nodes_only: true
   save_scenegraph_json: false
