@@ -1,6 +1,7 @@
 import base64
 import math
 import os
+import re
 import time
 import threading
 from collections import Counter
@@ -283,6 +284,33 @@ Object pair(s):
         }
         print(f"[scenegraph][cfg] runtime config: {self.runtime_cfg}", flush=True)
 
+    def _normalize_reason_text(self, text):
+        if text is None:
+            return ""
+        s = str(text).replace("\r", " ").replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _short_reason_text(self, text, max_chars=96):
+        s = self._normalize_reason_text(text)
+        if len(s) <= max_chars:
+            return s
+        return s[: max(0, max_chars - 3)] + "..."
+
+    def _set_reason_visualization(self, parts, max_chars=520):
+        flat_parts = []
+        for p in parts:
+            s = self._normalize_reason_text(p)
+            if s:
+                flat_parts.append(s)
+        if len(flat_parts) == 0:
+            self.reason_visualization = ""
+            return
+        text = " | ".join(flat_parts)
+        if len(text) > max_chars:
+            text = text[: max(0, max_chars - 3)] + "..."
+        self.reason_visualization = text
+
     def set_agent(self, agent):
         self.agent = agent
 
@@ -337,6 +365,12 @@ Object pair(s):
 
     def get_seg_caption(self):
         return self.seg_caption
+
+    def _clip_map_xy(self, x, y):
+        """Clamp map-space x/y into valid integer cell coordinates."""
+        x_i = int(np.clip(int(round(float(x))), 0, self.map_size - 1))
+        y_i = int(np.clip(int(round(float(y))), 0, self.map_size - 1))
+        return x_i, y_i
 
     def init_room_nodes(self):
         room_nodes = []
@@ -683,12 +717,20 @@ Object pair(s):
             x = int(center[0] * 100 / self.map_resolution)
             y = int(center[1] * 100 / self.map_resolution)
             y = self.map_size - 1 - y
-            node.set_center([x, y])
-            if 0 <= x < self.map_size and 0 <= y < self.map_size and hasattr(self, 'room_map'):
-                if sum(self.room_map[0, :, y, x]!=0).item() == 0:
+            x_clip, y_clip = self._clip_map_xy(x, y)
+            if x_clip != x or y_clip != y:
+                print(
+                    "[scenegraph][warn] node center clipped "
+                    f"caption={node.caption!r} raw=({x},{y}) clipped=({x_clip},{y_clip}) "
+                    f"map_size={self.map_size}",
+                    flush=True,
+                )
+            node.set_center([x_clip, y_clip])
+            if hasattr(self, 'room_map'):
+                if sum(self.room_map[0, :, y_clip, x_clip]!=0).item() == 0:
                     room_label = 0
                 else:
-                    room_label = torch.where(self.room_map[0, :, y, x]!=0)[0][0].item()
+                    room_label = torch.where(self.room_map[0, :, y_clip, x_clip]!=0)[0][0].item()
             else:
                 room_label = 0
             if node.room_node is not self.room_nodes[room_label]:
@@ -704,6 +746,7 @@ Object pair(s):
         edge_max_per_step = self.runtime_cfg["edge_max_per_step"]
         edge_llm_batch_size = self.runtime_cfg["edge_llm_batch_size"]
         edge_llm_timeout_s = self.runtime_cfg["edge_llm_timeout_s"]
+        reason_parts = []
         old_nodes = []
         new_nodes = []
         for i, node in enumerate(self.nodes):
@@ -712,8 +755,13 @@ Object pair(s):
                 node.is_new_node = False
             else:
                 old_nodes.append(node)
+        reason_parts.append(
+            f"edge_update new_nodes={len(new_nodes)} old_nodes={len(old_nodes)} skip_edge_llm={bool(skip_edge_llm)}"
+        )
         if len(new_nodes) == 0:
             print("[scenegraph][edge] no new nodes, skip", flush=True)
+            reason_parts.append("no new nodes -> skip VLM/LLM relation inference")
+            self._set_reason_visualization(reason_parts)
             return
         # create the edge between new_node and old_node
         new_edges = []
@@ -739,9 +787,13 @@ Object pair(s):
             )
             new_edges = new_edges[:edge_max_per_step]
         print(f"[scenegraph][edge] unresolved edges before VLM: {len(new_edges)}", flush=True)
+        unresolved_before_vlm = len(new_edges)
+        vlm_examples = []
+        vlm_attempted = 0
         for new_edge in new_edges:
             image = self.get_joint_image(new_edge.node1, new_edge.node2)
             if image is not None:
+                vlm_attempted += 1
                 prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
                 if skip_edge_llm:
                     print("[scenegraph][edge] skip VLM by config skip_edge_llm=true", flush=True)
@@ -756,6 +808,10 @@ Object pair(s):
                     print(f"[scenegraph][edge] VLM done in {dt:.2f}s", flush=True)
                     response = response.replace('.', '').lower()
                     new_edge.set_relation(response)
+                    if len(vlm_examples) < 3:
+                        vlm_examples.append(
+                            f"VLM({new_edge.node1.caption},{new_edge.node2.caption})={self._short_reason_text(response, max_chars=40)}"
+                        )
         new_edges = set()
         for i, node in enumerate(self.nodes):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
@@ -768,6 +824,8 @@ Object pair(s):
             )
             new_edges = new_edges[:edge_max_per_step]
         print(f"[scenegraph][edge] unresolved edges before LLM proposal: {len(new_edges)}", flush=True)
+        unresolved_before_llm = len(new_edges)
+        llm_examples = []
         # get all relation proposals
         if len(new_edges) > 0:
             for batch_start in range(0, len(new_edges), edge_llm_batch_size):
@@ -791,17 +849,49 @@ Object pair(s):
                     dt = time.time() - t0
                     if response_text is None:
                         print(f"[scenegraph][edge] LLM proposal timeout in {dt:.2f}s (skip batch)", flush=True)
+                        if len(llm_examples) < 2:
+                            llm_examples.append(
+                                f"LLM(batch={batch_start // edge_llm_batch_size + 1})=timeout"
+                            )
                         continue
                     print(f"[scenegraph][edge] LLM proposal done in {dt:.2f}s", flush=True)
                     relations = response_text.split('\n')
                 if len(relations) == len(batch_edges):
                     for i, relation in enumerate(relations):
                         batch_edges[i].set_relation(relation)
+                        if len(llm_examples) < 4:
+                            llm_examples.append(
+                                f"LLM({batch_edges[i].node1.caption},{batch_edges[i].node2.caption})={self._short_reason_text(relation, max_chars=40)}"
+                            )
+                elif (not skip_edge_llm) and len(llm_examples) < 2:
+                    llm_examples.append(
+                        f"LLM(batch={batch_start // edge_llm_batch_size + 1})=mismatch:{len(relations)}/{len(batch_edges)}"
+                    )
             # discriminate all relation proposals
             self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
+            kept_edges = 0
+            dropped_edges = 0
             for i, new_edge in enumerate(new_edges):
                 if new_edge.relation == None or not self.discriminate_relation(new_edge):
                     new_edge.delete()
+                    dropped_edges += 1
+                else:
+                    kept_edges += 1
+            reason_parts.append(
+                f"edge_unresolved pre_vlm={unresolved_before_vlm} pre_llm={unresolved_before_llm} kept={kept_edges} dropped={dropped_edges}"
+            )
+        else:
+            reason_parts.append(
+                f"edge_unresolved pre_vlm={unresolved_before_vlm} pre_llm=0"
+            )
+        reason_parts.append(f"vlm_attempted_pairs={vlm_attempted}")
+        if skip_edge_llm:
+            reason_parts.append("VLM/LLM outputs skipped by config")
+        if len(vlm_examples) > 0:
+            reason_parts.append("; ".join(vlm_examples))
+        if len(llm_examples) > 0:
+            reason_parts.append("; ".join(llm_examples))
+        self._set_reason_visualization(reason_parts)
 
     def update_group(self):
         for room_node in self.room_nodes:
@@ -830,21 +920,44 @@ Object pair(s):
                 room_node_text = room_node_text + room_node.caption + ','
         # room_node_text[-2] = '.'
         if room_node_text == '':
+            self._set_reason_visualization(
+                [f"room_predict goal={goal}", "no candidate room groups -> skip room LLM"]
+            )
             return None
         prompt = self.prompt_room_predict.format(goal, room_node_text)
         response = self.get_llm_response(prompt=prompt)
-        response = response.lower()
+        response = self._normalize_reason_text(response).lower()
+        reason_parts = [
+            f"room_predict goal={goal}",
+            f"room_candidates={self._short_reason_text(room_node_text, max_chars=96)}",
+            f"room_llm={self._short_reason_text(response, max_chars=84)}",
+        ]
         predict_room_node = None
         for room_node in self.room_nodes:
             if len(room_node.group_nodes) > 0 and room_node.caption.lower() in response:
                 predict_room_node = room_node
         if predict_room_node is None:
+            reason_parts.append("no room matched LLM output")
+            self._set_reason_visualization(reason_parts)
             return None
+        corr_traces = []
         for group_node in predict_room_node.group_nodes:
             corr_score = self.graph_corr(goal, group_node)
             group_node.corr_score = corr_score
+            trace = getattr(self, "_last_graph_corr_trace", "")
+            if trace and len(corr_traces) < 2:
+                corr_traces.append(trace)
         sorted_group_nodes = sorted(predict_room_node.group_nodes)
         self.mid_term_goal = sorted_group_nodes[-1].center
+        reason_parts.append(
+            f"selected_room={predict_room_node.caption} group_count={len(predict_room_node.group_nodes)}"
+        )
+        reason_parts.append(
+            f"mid_term_goal=({int(self.mid_term_goal[0])},{int(self.mid_term_goal[1])})"
+        )
+        if len(corr_traces) > 0:
+            reason_parts.append("; ".join(corr_traces))
+        self._set_reason_visualization(reason_parts)
         return self.mid_term_goal
     
     def update_scenegraph(self):
@@ -865,6 +978,10 @@ Object pair(s):
             print('[scenegraph] before update_edge', flush=True)
             self.update_edge()
             print('[scenegraph] after update_edge', flush=True)
+        else:
+            self._set_reason_visualization(
+                [f"scenegraph step={self.navigate_steps}", "no segment2d detections this step"]
+            )
     
     def get_llm_response(self, prompt, timeout_s=None):
         payload = {
@@ -1001,6 +1118,7 @@ Object pair(s):
             for i in range(1, n):
                 x = int(x1 + (x2 - x1) * i / n)
                 y = int(y1 + (y2 - y1) * i / n)
+                x, y = self._clip_map_xy(x, y)
                 if not self.free_map[y, x]:
                     return False
             return True
@@ -1024,4 +1142,12 @@ Object pair(s):
         prompt = self.prompt_graph_corr_3.format(response_0, response_1 + response_2, graph.center_node.caption, goal)
         response_3 = self.get_llm_response(prompt=prompt)
         corr_score = text2value(response_3)
+        self._last_graph_corr_trace = (
+            f"corr[{graph.center_node.caption}->{goal}] "
+            f"p0={self._short_reason_text(response_0, max_chars=14)} "
+            f"q={self._short_reason_text(response_1, max_chars=24)} "
+            f"a={self._short_reason_text(response_2, max_chars=24)} "
+            f"p1={self._short_reason_text(response_3, max_chars=14)} "
+            f"score={float(corr_score):.3f}"
+        )
         return corr_score

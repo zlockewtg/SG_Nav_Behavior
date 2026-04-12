@@ -38,6 +38,42 @@ def add_resized_image(base_image: np.ndarray, overlay_image: np.ndarray, positio
     base_image[y:y+h, x:x+w] = resized_overlay
     return base_image
 
+def add_resized_image_contain(
+    base_image: np.ndarray,
+    overlay_image: np.ndarray,
+    position: tuple,
+    size: tuple,
+    pad_color=(255, 255, 255),
+    interpolation_up=cv2.INTER_LINEAR,
+    interpolation_down=cv2.INTER_AREA,
+):
+    target_w, target_h = int(size[0]), int(size[1])
+    x, y = int(position[0]), int(position[1])
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError("Target size must be positive.")
+    if x + target_w > base_image.shape[1] or y + target_h > base_image.shape[0]:
+        raise ValueError("Overlay image goes out of the bounds of the base image.")
+
+    oh, ow = overlay_image.shape[:2]
+    if oh <= 0 or ow <= 0:
+        raise ValueError("Overlay image must be non-empty.")
+
+    scale = min(float(target_w) / float(ow), float(target_h) / float(oh))
+    resized_w = max(1, int(round(float(ow) * scale)))
+    resized_h = max(1, int(round(float(oh) * scale)))
+    resized_overlay = cv2.resize(
+        overlay_image,
+        (resized_w, resized_h),
+        interpolation=interpolation_down if scale < 1.0 else interpolation_up,
+    )
+
+    canvas = np.full((target_h, target_w, 3), pad_color, dtype=base_image.dtype)
+    off_x = (target_w - resized_w) // 2
+    off_y = (target_h - resized_h) // 2
+    canvas[off_y : off_y + resized_h, off_x : off_x + resized_w] = resized_overlay
+    base_image[y : y + target_h, x : x + target_w] = canvas
+    return base_image
+
 def compute_crop_rect(img_height: int, img_width: int, point: tuple, size: tuple) -> tuple[int, int, int, int]:
     """Return (left, top, right, bottom) using the same rules as ``crop_around_point``."""
     crop_width, crop_height = size

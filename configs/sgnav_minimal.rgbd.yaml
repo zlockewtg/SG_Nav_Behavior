@@ -33,163 +33,81 @@ DATASET:
   SCENES_DIR: ""
 
 SGNAV_RUNTIME:
-  # HTTP: optional camera_pose_world on /step (e.g. robot.links["zed_link"] position m + quaternion xyzw).
-  # When present, depth→map uses that pitch (Euler Y from quat) and optional world Z as sensor height (cm).
-  camera_extrinsic_use_client_pose: true
-  camera_height_from_world_z: true
-  # When camera_pose_world is absent/disabled, use this fixed camera height (cm) for depth projection.
-  # Set <=0 to disable fallback and use AGENT_0.HEIGHT*100.
+  # HTTP camera_pose_world fallback height (cm) when the client pose is absent/disabled.
   camera_height_fallback_cm: 100.0
-  camera_height_z_offset_m: 0.0
-  # Prefer vector-derived camera tilt from quaternion (more stable than Euler roll branch).
   camera_tilt_source: cam_z_down
-  camera_pitch_mapping_scale: 1.0
-  camera_pitch_mapping_offset_deg: 0.0
-  # Dynamic depth->map vertical bands (cm). If map_obstacle_max_z_cm <= 0, use camera_height + map_obstacle_above_camera_cm.
+  # Depth->map vertical bands (cm).
   map_obstacle_min_z_cm: 25.0
-  map_obstacle_max_z_cm: -1.0
-  map_obstacle_above_camera_cm: 50.0
-  map_free_min_z_cm: -150.0
-  map_free_max_z_cm: 25.0
-  log_mapping_height_band: true
-  # Clamp camera extrinsics used by depth->map projection to avoid extreme link-pose spikes flooding traversible.
   camera_pitch_min_deg: -35.0
   camera_pitch_max_deg: 35.0
   camera_height_min_cm: 120.0
-  camera_height_max_cm: 220.0
-  camera_extrinsic_reject_outlier: true
   camera_height_reject_min_cm: 120.0
-  camera_height_reject_max_cm: 210.0
-  camera_pitch_reject_abs_deg: 55.0
-  log_camera_extrinsic_clamp: true
-  # true: stderr [SG-Nav][camera_pose] each step when /step sends camera_pose_world (position m, quat xyzw, rpy, map pitch, height cm).
   log_camera_pose_world: true
-  # Print one line at reset with coordinate-frame assumptions (A1-A4) used by planner/visualization.
-  # Keep true while validating alignment; set false after stable.
-  log_coordinate_assumptions: true
-  # Per-step depth/map stats (depth range, full_map occupancy, collision occupancy, traversible free ratio).
-  # Use this to diagnose "traversible almost all light gray" quickly from server stderr.
-  log_mapping_stats: true
-  # Extra map-write diagnostics:
-  # [SG-Nav][full_map_delta]: per-step new/deleted obstacle ratios (global + robot-local).
-  # [SG-Nav][collision_paint]: cells painted by forward-collision heuristic in _plan.
-  log_full_map_delta: true
-  log_collision_paint: true
-  # Structured health checks. Watch [SG-Nav][check] and only inspect flags:
-  # - TRAVERSIBLE_TOO_FREE / DEPTH_TOO_MANY_ZEROS / DEPTH_MEDIAN_OUT_OF_RANGE
-  # - CAMERA_ROLL_LARGE / CAMERA_PITCH_LARGE / CAMERA_HEIGHT_OUTLIER / FALL_SUSPECTED
-  log_runtime_checks: true
-  check_traversible_free_warn: 0.95
-  check_depth_zero_warn: 0.25
-  check_depth_median_min_m: 0.08
-  check_depth_median_max_m: 8.0
-  check_camera_pitch_abs_warn_deg: 35.0
-  check_camera_roll_abs_warn_deg: 45.0
-  check_camera_height_min_warn_cm: 70.0
-  check_camera_height_max_warn_cm: 210.0
-  # OmniGibson / HTTP: two different uses of pose:
-  #   • Agent position on the map tensor = gps only (analyze_sgnav_nav_debug.py checks Δgps↔Δworld).
-  #   • Occupancy / free space from depth = compass + camera geometry (utils_fmm/mapping.py pose_transform: heading−90°).
-  # So “gps chain OK” does NOT fix “obstacles or open wedge drift sideways vs real motion” — that is almost always
-  # compass vs robot/camera forward. If straight FORWARD in sim makes the wedge slide left/right on the panel,
-  # tune compass_offset_deg (try 90 or −90 in 90° steps first).
+  # Pause depth->map fusion for a few steps when collision coincides with a fallen / abnormal camera pose.
+  map_suspend_on_fall: true
+  map_suspend_steps_on_fall: 4
+  map_suspend_roll_deg: 70.0
+  map_suspend_pitch_deg: 50.0
+  map_suspend_height_cm: 95.0
+  map_suspend_height_delta_cm: 20.0
+  # Tune this when depth wedge orientation drifts sideways versus real robot forward.
   compass_offset_deg: -90.0
-  # If the agent *dot* drifts along the wrong axis vs simulator motion (not the depth wedge), try gps_negate_y: true.
-  gps_negate_y: false
-  # HTTP: when ``target_world_xy`` is sent and that grid cell (±3) is on explored occupancy (visited / free / semantic),
-  # set goal_map to the sim object position and run the usual FMM short-term planner toward it (no GLIP found_goal).
+  # If target_world_xy is available and already lies on explored occupancy, plan directly to it.
   gt_pathplan_when_target_on_map: true
-  # OmniGibson bridge: physical targets in m/s and rad/s, normalized in sgnav_behavior_bridge to [-1,1]
-  # before HolonomicBaseJointController (caps ~1.5 m/s, ~π rad/s). Values > cap saturate; do NOT expect
-  # |cmd|>1 in the tensor — raw 25 rad/s used to clip to 1.0 like any value ≥1, so turn size never changed.
-  # HTTP server ignores these; eval script reads them with --sgnav_config or sibling default yaml.
+  # HTTP server ignores these; eval script reads them as branch-specific movement defaults.
+  # Velocity branch defaults.
   behavior_forward_vel: 3
   behavior_turn_vel: 25
-  # Habitat-style gps grid (cm); must match SG_Nav_Agent.map_size_cm if you change it in code/config.
-  map_size_cm: 4000.0
-  # HTTP ``og_occupancy`` fusion: reseed collision_map from depth each step; strict obstacle band (unknown 0.5 never painted).
-  og_occ_reseed_collision_from_depth: true
-  og_occ_obstacle_max: 0.12
-  og_occ_free_min: 0.85
-  # Set false to only clear cells where OG reports free (no extra obstacle paint from scan).
-  og_occ_fuse_obstacles: false
-  # Traversible obstacle inflation in meters (preferred): internally converted to cells by map_resolution.
-  # At 5cm/cell, 0.1m -> 2 cells.
+  # Position branch defaults. Keep these much more conservative than velocity mode because
+  # absolute base deltas can destabilize the robot more easily in OmniGibson physics.
+  behavior_position_forward_step_size_m: 0.05
+  behavior_position_turn_angle_deg: 10
+  behavior_position_physical_look_pitch_step_deg: 5
+  # Traversible obstacle inflation in meters.
   traversible_obstacle_inflation_m: 0.1
-  # Legacy fallback in cells (used only when traversible_obstacle_inflation_m < 0).
   traversible_obstacle_disk_radius: 2
-  # full_map obstacle threshold (0..1): lower catches thinner obstacles; higher is more conservative.
-  traversible_occ_from_depth_min: 0.35
-  # If true, unknown cells are non-traversible unless marked free by fbe_free_map.
-  traversible_require_explored: false
-  # Robot-local prior free disk: clear a small neighborhood around the robot and seed it into free_map.
-  traversible_clear_robot_obs_enable: true
+  traversible_occ_from_depth_min: 0.45
   traversible_clear_robot_obs_radius_m: 1
-  # Traversible frame in SG-Nav get_traversible (fixed to avoid step-wise frame switching).
-  map_frame_auto_select: false
-  map_frame_fixed_mode: flipud
-  # fbe_free_map free threshold (0..1).
+  traversible_clear_robot_obs_enable: true
+  traversible_require_explored: false
   traversible_free_map_min: 0.25
-  # Mapping voxel-count thresholds (utils_fmm/mapping.py). Lower => obstacles/free appear easier.
+  map_frame_fixed_mode: flipud
   sem_map_pred_threshold: 2.0
-  sem_exp_pred_threshold: 2.0
-  free_map_pred_threshold: 0.5
-  free_exp_pred_threshold: 0.5
-  # Explored-only startup bootstrap: when traversible is nearly empty, open a local non-obstacle
-  # circle around the agent to avoid deadlock before free_map accumulates.
+  sem_exp_pred_threshold: 2.5
+  # full_map diagnosis toggles: enable only one at a time against the same route/seed.
+  diag_freeze_camera_extrinsics: false
+  diag_disable_pose_bridge: false
+  # current | legacy_strict
+  diag_sem_threshold_profile: current
+  # nearest | bilinear
+  diag_map_warp_mode: nearest
   traversible_bootstrap_enable: true
   traversible_bootstrap_min_free_ratio: 0.002
   traversible_bootstrap_radius_m: 0.9
-  # Meters: when FORWARD and GPS moved less than this, paint obstacle cells ahead (stuck / hit wall).
-  # Slightly higher → fewer spurious obstacle marks (less "full"); lower → safer but more paint.
   collision_threshold_m: 0.08
   # Optional: VisionSensor native horizontal_aperture (unset = OmniGibson default for the robot).
   # behavior_vision_horizontal_aperture: 40.0
   detect_interval: 5
-  # Wider cone (deg) → FORWARD sooner after panorama; narrow values feel like endless in-place turning.
-  planner_align_angle_deg: 40
-  # After TURN_LEFT/RIGHT, only switch to FORWARD when |heading error| <= (align − hysteresis).
-  # Reduces left-right-left wobble from noisy compass / jumping STG. Set 0 to disable (legacy symmetric thresholds).
-  planner_align_hysteresis_deg: 10.0
-  # FMM local policy: only FORWARD when |heading − STG bearing| ≤ this (deg); otherwise turn in place toward STG.
-  # -1 disables (uses planner_align_angle_deg / hysteresis wide cone). Smaller → stricter “always face goal before driving”.
+  scenegraph_update_interval: 5
+  planner_align_angle_deg: 30
+  planner_align_hysteresis_deg: 5.0
   planner_face_goal_max_error_deg: 30.0
-  # While no goal hint, keep issuing TURN (action 6) until this step (default 22). Lower = end panorama earlier.
   panorama_spin_until_step: 22
-  # FMM short-term goal: local patch half-width in grid cells (default 5). Larger → coarser STG, less jitter.
-  fmm_step_size: 5
-  # FMM subgoal “close enough” threshold (fmm_planner.stop_cond); lower → more steps before stop=True at STG.
+  fmm_step_size: 3
   fmm_stop_cond: 1
-  # Confirmed target approach: once found_goal=True, use this distance (m) as the terminal standoff threshold.
-  # The agent keeps path-planning toward the target, then stops only after it is both within this distance and facing it.
-  goal_stop_distance_threshold_m: 1.0
-  # Confirmed target approach: final heading error tolerance (deg) before STOP.
+  goal_stop_distance_threshold_m: 0.3
   goal_stop_face_threshold_deg: 12.0
-  # When GLIP matches the goal bbox, print goal_gps_map vote_max vs obj_min_detections (stderr).
-  log_goal_votes: true
-  # Per-step planner line: goal_map_src, found_goal / found_possible_goal, replan_fbe, stuck_reset, action.
   nav_debug_trace: true
-  # stderr [SG-Nav][pose_align]: HTTP obs gps/compass, full_pose, STG cell, start_o vs stg_bearing, rel_deg.
-  # Normal: turning in place → compass_rad changes, gps_delta small. Forward → gps_delta often > 0.05.
-  # If rel_deg stays large (> fwd_exit) while only turning → alignment or STG/compass frame issue.
   log_pose_align_trace: true
-  # If true: print goal_rc + Manhattan drift vs last step (spot frequent frontier / goal jumps).
   log_goal_cell_drift: true
-  # [SG-Nav][spin] per step: classify why the agent turns / explores vs drives forward.
-  log_spin_diagnosis: true
-  # After get_traversible each act(): PNGs full_map[0,0], collision, visited,
-  # traversible_with_boundary, traversible_core (1:-1 strip). Omit or empty = off.
-  # nav_grid_dump_dir: data/visualization/experiment_0/nav_grids
-  # Detection voting radius: bbox depth >= this is treated as a far hint / possible goal, not the final stop distance.
   goal_distance_threshold: 8.0
-  show_frame_nodes_only: true
   save_scenegraph_json: false
+  show_frame_nodes_only: true
   glip_append_goal_sg: true
   # Extra GLIP phrases (comma/semicolon). Logs showed bbox=0 when labels were only table/picture —
   # add synonyms so detections can map to goal match_tokens (radio / receiver).
-
+  # behavior_base_action_mode: position
+  behavior_position_forward_physics_steps_per_nav_step: 5
+  behavior_position_turn_physics_steps_per_nav_step: 1
   scenegraph:
-    skip_edge_llm: true
-    edge_max_per_step: 24
-    edge_llm_batch_size: 8
-    edge_llm_timeout_s: 20.0
+    skip_edge_llm: false

@@ -58,6 +58,9 @@ class Semantic_Mapping(nn.Module):
                          ).float().to(self.device)
         # When set (cm), depth projection uses this height instead of cfg AGENT_0.HEIGHT*100 (HTTP / zed_link).
         self._extrinsic_height_cm = None
+        self._diag_warp_mode = "nearest"
+        self._diag_collect_fusion_stats = False
+        self._last_fusion_diag = None
 
     def set_view_angles(self, view_angle):
         self.view_angles[0] = -view_angle
@@ -65,6 +68,36 @@ class Semantic_Mapping(nn.Module):
     def _camera_height_cm_for_projection(self):
         h = getattr(self, "_extrinsic_height_cm", None)
         return float(h) if h is not None else float(self.agent_height)
+
+    def _get_grid_sample_mode(self):
+        mode = str(getattr(self, "_diag_warp_mode", "nearest") or "nearest").strip().lower()
+        if mode not in ("nearest", "bilinear"):
+            mode = "nearest"
+        return mode
+
+    def _record_fusion_diag(self, agent_view, translated, maps_last):
+        if not bool(getattr(self, "_diag_collect_fusion_stats", False)):
+            self._last_fusion_diag = None
+            return
+        local_occ = agent_view > 0.5
+        translated_occ = translated > 0.5
+        prev_occ = maps_last > 0.5
+        overlap = torch.logical_and(translated_occ, prev_occ)
+        translated_count = int(translated_occ.sum().item())
+        overlap_count = int(overlap.sum().item())
+        overlap_ratio = (
+            float(overlap_count) / float(translated_count) if translated_count > 0 else 0.0
+        )
+        self._last_fusion_diag = {
+            "warp_mode": self._get_grid_sample_mode(),
+            "local_patch_occ_count": int(local_occ.sum().item()),
+            "translated_occ_count": translated_count,
+            "maps_last_occ_count": int(prev_occ.sum().item()),
+            "overlap_count": overlap_count,
+            "overlap_ratio": float(overlap_ratio),
+            "local_patch_max": float(agent_view.max().item()) if agent_view.numel() > 0 else 0.0,
+            "translated_max": float(translated.max().item()) if translated.numel() > 0 else 0.0,
+        }
 
     def forward(self, depth, pose_obs, maps_last, type_mask=None, type_prob=None):
         if type_mask is not None:
@@ -183,8 +216,14 @@ class Semantic_Mapping(nn.Module):
         rot_mat, trans_mat = get_grid(st_pose, agent_view.size(),
                                         self.device)
 
-        rotated = F.grid_sample(agent_view, rot_mat, align_corners=True)
-        translated = F.grid_sample(rotated, trans_mat, align_corners=True)
+        warp_mode = self._get_grid_sample_mode()
+        rotated = F.grid_sample(
+            agent_view, rot_mat, mode=warp_mode, align_corners=True
+        )
+        translated = F.grid_sample(
+            rotated, trans_mat, mode=warp_mode, align_corners=True
+        )
+        self._record_fusion_diag(agent_view, translated, maps_last)
 
         maps2 = torch.cat((maps_last.unsqueeze(1), translated.unsqueeze(1)), 1)
         map_pred, _ = torch.max(maps2,1)
@@ -276,11 +315,17 @@ class Semantic_Mapping(nn.Module):
         rot_mat, trans_mat = get_grid(st_pose, agent_view.size(),
                                         self.device)
 
-        rotated = F.grid_sample(agent_view, rot_mat, align_corners=True)
-        translated = F.grid_sample(rotated, trans_mat, align_corners=True)
+        warp_mode = self._get_grid_sample_mode()
+        rotated = F.grid_sample(
+            agent_view, rot_mat, mode=warp_mode, align_corners=True
+        )
+        translated = F.grid_sample(
+            rotated, trans_mat, mode=warp_mode, align_corners=True
+        )
 
         for i in range(c):
             translated[0,i][translated[0,i]>0] = type_prob[i]
+        self._record_fusion_diag(agent_view, translated, maps_last)
         maps2 = torch.cat((maps_last.unsqueeze(1), translated.unsqueeze(1)), 1) # n*2*w*h
         map_pred, _ = torch.max(maps2,1)
 
