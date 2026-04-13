@@ -25,6 +25,7 @@ See ../openpi-comet/scripts/eval_skill_sgnav_http.py for the OmniGibson client.
 Runtime options are configured in the yaml config file under ``SGNAV_RUNTIME``:
 
   detect_interval: 4
+  scenegraph_update_interval: 1
   planner_align_angle_deg: 26.0
   planner_face_goal_max_error_deg: 15.0   # -1 = wide cone only; >=0 = face STG within this deg before FORWARD
   panorama_spin_until_step: 22
@@ -54,6 +55,17 @@ from typing import Optional
 import cv2
 import numpy as np
 
+
+def _configure_live_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            pass
+
+
+_configure_live_stdio()
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -62,6 +74,8 @@ class _AgentHolder:
     agent = None
     args = None
     config_path: Optional[str] = None
+    warmed_up = False
+    warmup_thread: Optional[threading.Thread] = None
 
 
 def _flush_episode_video_if_needed(agent) -> None:
@@ -157,6 +171,20 @@ def _parse_step_body(data: dict) -> dict:
                 out["camera_pose_world"] = out_cp
             except (TypeError, ValueError):
                 pass
+    ci = data.get("collision_info")
+    if isinstance(ci, dict):
+        try:
+            out["collision_info"] = {
+                "base_contact": bool(ci.get("base_contact", False)),
+                "n_contacts": int(ci.get("n_contacts", 0)),
+                "contact_bodies": [str(x) for x in list(ci.get("contact_bodies", []))[:8]],
+                "max_impulse": float(ci.get("max_impulse", 0.0)),
+                "prev_action": (
+                    None if ci.get("prev_action") is None else int(ci.get("prev_action"))
+                ),
+            }
+        except (TypeError, ValueError):
+            pass
     return out
 
 
@@ -171,6 +199,44 @@ def _ensure_agent(cfg_path: str, nav_args) -> None:
     cfg = OmegaConf.load(cfg_path)
     _AgentHolder.agent = SG_Nav_Agent(cfg, nav_args)
     _AgentHolder.agent.simulator = None
+
+
+def _maybe_warmup_agent(force: bool = False, runs: int = 2):
+    agent = _AgentHolder.agent
+    if agent is None:
+        return None
+    if _AgentHolder.warmed_up and not force:
+        return {"status": "already_warmed"}
+    result = agent.warmup(runs=runs)
+    _AgentHolder.warmed_up = True
+    return result
+
+
+def _start_background_warmup(cfg_path: str, nav_args, runs: int) -> bool:
+    thr = _AgentHolder.warmup_thread
+    if thr is not None and thr.is_alive():
+        return False
+
+    def _run():
+        print(
+            f"startup warmup begin: runs={max(1, int(runs))}",
+            flush=True,
+        )
+        try:
+            with _AgentHolder.lock:
+                _ensure_agent(cfg_path, nav_args)
+                result = _maybe_warmup_agent(force=True, runs=runs)
+            print(f"startup warmup complete: {result}", flush=True)
+        except Exception as e:
+            print(
+                f"startup warmup failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+
+    thr = threading.Thread(target=_run, name="sgnav-startup-warmup", daemon=True)
+    _AgentHolder.warmup_thread = thr
+    thr.start()
+    return True
 
 
 class SGNavHTTPHandler(BaseHTTPRequestHandler):
@@ -194,7 +260,32 @@ class SGNavHTTPHandler(BaseHTTPRequestHandler):
         if self.path.rstrip("/").endswith("/step") or self.path == "/step":
             self._handle_step()
             return
+        if self.path.rstrip("/").endswith("/warmup") or self.path == "/warmup":
+            self._handle_warmup()
+            return
         _json_response(self, 404, {"error": "not_found"})
+
+    def _handle_warmup(self):
+        try:
+            data = _read_json_body(self)
+        except json.JSONDecodeError as e:
+            _json_response(self, 400, {"error": "invalid_json", "detail": str(e)})
+            return
+        runs = data.get("runs", getattr(self.nav_args, "warmup_runs", 2))
+        try:
+            runs = max(1, int(runs))
+        except (TypeError, ValueError):
+            _json_response(self, 400, {"error": "invalid_runs"})
+            return
+        force = bool(data.get("force", False))
+        with _AgentHolder.lock:
+            try:
+                _ensure_agent(self.cfg_path, self.nav_args)
+                result = _maybe_warmup_agent(force=force, runs=runs)
+            except Exception as e:
+                _json_response(self, 500, {"error": str(e), "type": type(e).__name__})
+                return
+        _json_response(self, 200, {"status": "warmed", "result": result})
 
     def _handle_reset(self):
         try:
@@ -262,6 +353,8 @@ def main():
         default=os.path.join(REPO_ROOT, "configs/sgnav_minimal.rgbd.yaml"),
     )
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--warmup", action="store_true")
+    parser.add_argument("--warmup-runs", type=int, default=2)
     args = parser.parse_args()
 
     sys.path.insert(0, REPO_ROOT)
@@ -270,6 +363,8 @@ def main():
         visualize=bool(args.visualize),
         split_l=-1,
         split_r=-1,
+        warmup=bool(args.warmup),
+        warmup_runs=max(1, int(args.warmup_runs)),
     )
     _AgentHolder.config_path = args.config
     SGNavHTTPHandler.cfg_path = args.config
@@ -277,12 +372,21 @@ def main():
     server = HTTPServer((args.host, args.port), SGNavHTTPHandler)
     print(f"SG-Nav HTTP server on http://{args.host}:{args.port}", flush=True)
     print("POST /step   body: ObservationMsg (arrays as base64)", flush=True)
+    print("POST /warmup body: {\"runs\": 2, \"force\": false}  # optional explicit CUDA/model warmup", flush=True)
     if args.visualize:
         print(
             "  --visualize: writes data/visualization/experiment_0/video/current_frame.jpg each act step; "
             "vid_XXXXXX.mp4 on next /reset, at 500 steps, or server shutdown.",
             flush=True,
         )
+    if args.warmup:
+        started = _start_background_warmup(args.config, nav_args, nav_args.warmup_runs)
+        if started:
+            print(
+                "startup warmup scheduled in background; /health is available immediately, "
+                "and /step will wait on the agent lock if warmup is still running.",
+                flush=True,
+            )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -2,9 +2,9 @@
 # Use: OmegaConf.load / habitat.get_config — same structure Habitat tasks expect.
 
 SIMULATOR:
-  TURN_ANGLE: 60
+  TURN_ANGLE: 20
   TILT_ANGLE: 30
-  FORWARD_STEP_SIZE: 0.5
+  FORWARD_STEP_SIZE: 0.25
   AGENT_0:
     HEIGHT: 0.88
     RADIUS: 0.18
@@ -33,20 +33,24 @@ DATASET:
   SCENES_DIR: ""
 
 SGNAV_RUNTIME:
+  visualize_centered_crop_ratio: 0.3
   # HTTP camera_pose_world fallback height (cm) when the client pose is absent/disabled.
   camera_height_fallback_cm: 100.0
   camera_tilt_source: cam_z_down
   # Depth->map vertical bands (cm).
   map_obstacle_min_z_cm: 25.0
-  camera_pitch_min_deg: -35.0
-  camera_pitch_max_deg: 35.0
+  camera_pitch_min_deg: -45.0
+  camera_pitch_max_deg: 45.0
   camera_height_min_cm: 120.0
   camera_height_reject_min_cm: 120.0
+  camera_extrinsic_reject_motion_delta: true
+  camera_pitch_reject_delta_deg: 6.0
+  camera_height_reject_delta_cm: 8.0
   log_camera_pose_world: true
   # Pause depth->map fusion for a few steps when collision coincides with a fallen / abnormal camera pose.
   map_suspend_on_fall: true
   map_suspend_steps_on_fall: 4
-  map_suspend_roll_deg: 70.0
+  map_suspend_roll_deg: 85.0
   map_suspend_pitch_deg: 50.0
   map_suspend_height_cm: 95.0
   map_suspend_height_delta_cm: 20.0
@@ -55,16 +59,27 @@ SGNAV_RUNTIME:
   # If target_world_xy is available and already lies on explored occupancy, plan directly to it.
   gt_pathplan_when_target_on_map: true
   # HTTP server ignores these; eval script reads them as branch-specific movement defaults.
+  # behavior_base_action_mode: position
   # Velocity branch defaults.
-  behavior_forward_vel: 3
-  behavior_turn_vel: 25
+  behavior_forward_vel: 0.5
+  behavior_turn_vel: 1.75
+  behavior_velocity_forward_vel: 0.5
+  behavior_velocity_turn_vel: 1.75
+  behavior_physics_steps_per_nav_step: 2
   # Position branch defaults. Keep these much more conservative than velocity mode because
   # absolute base deltas can destabilize the robot more easily in OmniGibson physics.
-  behavior_position_forward_step_size_m: 0.05
-  behavior_position_turn_angle_deg: 10
+  behavior_position_forward_step_size_m: 0.02
+  behavior_position_turn_angle_deg: 5
+  behavior_position_physics_steps_per_nav_step: 1
+  behavior_position_forward_physics_steps_per_nav_step: 6
+  behavior_position_turn_physics_steps_per_nav_step: 11
   behavior_position_physical_look_pitch_step_deg: 5
+  behavior_look_pitch_sign: -1
+  # Keep a small buffer from the physical trunk pitch joint limits so repeated LOOK_UP / LOOK_DOWN
+  # during navigation cannot drive the head too close to the mechanical extremes.
+  behavior_physical_look_pitch_limit_margin_deg: 10
   # Traversible obstacle inflation in meters.
-  traversible_obstacle_inflation_m: 0.1
+  traversible_obstacle_inflation_m: 0.15
   traversible_obstacle_disk_radius: 2
   traversible_occ_from_depth_min: 0.45
   traversible_clear_robot_obs_radius_m: 1
@@ -106,8 +121,5 @@ SGNAV_RUNTIME:
   glip_append_goal_sg: true
   # Extra GLIP phrases (comma/semicolon). Logs showed bbox=0 when labels were only table/picture —
   # add synonyms so detections can map to goal match_tokens (radio / receiver).
-  # behavior_base_action_mode: position
-  behavior_position_forward_physics_steps_per_nav_step: 5
-  behavior_position_turn_physics_steps_per_nav_step: 1
   scenegraph:
     skip_edge_llm: false

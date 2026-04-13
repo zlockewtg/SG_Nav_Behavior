@@ -321,8 +321,11 @@ class SG_Nav_Agent():
         # Hard safety guard before issuing FORWARD:
         # if near lookahead cells are obstacle/non-traversible, convert FWD -> turn.
         self._forward_guard_enable = bool(_runtime_get("forward_guard_enable", True))
-        self._forward_guard_lookahead_m = float(_runtime_get("forward_guard_lookahead_m", 0.30))
-        self._forward_guard_samples = max(1, int(_runtime_get("forward_guard_samples", 4)))
+        self._forward_guard_lookahead_m = float(_runtime_get("forward_guard_lookahead_m", 0.50))
+        self._forward_guard_samples = max(1, int(_runtime_get("forward_guard_samples", 6)))
+        self._forward_guard_cone_half_angle_deg = float(
+            _runtime_get("forward_guard_cone_half_angle_deg", 25.0)
+        )
         self._random_goal_min_distance_m = float(
             _runtime_get("random_goal_min_distance_m", 0.60)
         )
@@ -578,6 +581,18 @@ class SG_Nav_Agent():
         )
         self._camera_pitch_reject_abs_deg = float(
             _runtime_get("camera_pitch_reject_abs_deg", 55.0)
+        )
+        # Additional guard for motion-induced camera pose jitter: during locomotion, reject sudden
+        # pitch / height jumps even if the absolute values are still within the global valid range.
+        # This keeps depth->map stable when the simulated head sensor bobs while the robot moves.
+        self._camera_extrinsic_reject_motion_delta = bool(
+            _runtime_get("camera_extrinsic_reject_motion_delta", False)
+        )
+        self._camera_pitch_reject_delta_deg = float(
+            _runtime_get("camera_pitch_reject_delta_deg", 6.0)
+        )
+        self._camera_height_reject_delta_cm = float(
+            _runtime_get("camera_height_reject_delta_cm", 4.0)
         )
         self._last_good_camera_height_cm = None
         self._last_good_camera_pitch_deg = None
@@ -925,14 +940,15 @@ class SG_Nav_Agent():
         client_collision = getattr(self, "_client_collision_prev", None) or {}
         had_contact = bool(client_collision.get("base_contact", False))
         suspected, reason = self._current_camera_fall_suspected()
-        if had_contact and suspected:
+        if suspected:
+            trigger = "collision_fall" if had_contact else "pose_fall"
             self._mapping_suspend_countdown = max(
                 int(getattr(self, "_mapping_suspend_countdown", 0)),
                 int(self._map_suspend_steps_on_fall),
             )
             print(
                 "[SG-Nav][map_suspend] "
-                f"step={self.total_steps} trigger=collision_fall "
+                f"step={self.total_steps} trigger={trigger} "
                 f"countdown={int(self._mapping_suspend_countdown)} "
                 f"reason={reason}",
                 flush=True,
@@ -1414,12 +1430,45 @@ class SG_Nav_Agent():
                     or float(h_cm_raw) < float(self._camera_height_reject_min_cm)
                     or float(h_cm_raw) > float(self._camera_height_reject_max_cm)
                 )
-            if pitch_bad or height_bad:
+            motion_jump_pitch = False
+            motion_jump_height = False
+            pitch_delta = None
+            height_delta = None
+            client_collision = getattr(self, "_client_collision_prev", None) or {}
+            prev_action = client_collision.get("prev_action", None)
+            prev_action_is_motion = prev_action in (1, 2, 3, 6)
+            if (
+                self._camera_extrinsic_reject_motion_delta
+                and prev_action_is_motion
+                and self._last_good_camera_pitch_deg is not None
+                and np.isfinite(float(pitch_deg))
+            ):
+                pitch_delta = abs(float(pitch_deg) - float(self._last_good_camera_pitch_deg))
+                motion_jump_pitch = pitch_delta >= float(self._camera_pitch_reject_delta_deg)
+            if (
+                self._camera_extrinsic_reject_motion_delta
+                and prev_action_is_motion
+                and self._camera_height_from_world_z
+                and h_cm is not None
+                and self._last_good_camera_height_cm is not None
+                and np.isfinite(float(h_cm))
+            ):
+                height_delta = abs(float(h_cm) - float(self._last_good_camera_height_cm))
+                motion_jump_height = height_delta >= float(self._camera_height_reject_delta_cm)
+            if pitch_bad or height_bad or motion_jump_pitch or motion_jump_height:
                 reasons = []
                 if pitch_bad:
                     reasons.append("pitch_outlier")
                 if height_bad:
                     reasons.append("height_outlier")
+                if motion_jump_pitch:
+                    reasons.append(
+                        f"pitch_motion_delta={float(pitch_delta):.1f}"
+                    )
+                if motion_jump_height:
+                    reasons.append(
+                        f"height_motion_delta={float(height_delta):.1f}cm"
+                    )
                 reject_reason = ",".join(reasons)
                 if self._last_good_camera_pitch_deg is not None:
                     pitch_deg = float(self._last_good_camera_pitch_deg)
@@ -1448,6 +1497,17 @@ class SG_Nav_Agent():
                 self._last_good_camera_pitch_deg = float(pitch_deg)
                 if self._camera_height_from_world_z and h_cm is not None:
                     self._last_good_camera_height_cm = float(h_cm)
+
+        _pitch_mismatch = abs(float(pitch_deg) - float(pitch_deg_raw))
+        _height_mismatch = (
+            abs(float(h_cm) - float(h_cm_raw))
+            if (h_cm is not None and h_cm_raw is not None)
+            else 0.0
+        )
+        if _pitch_mismatch > 0.5 or _height_mismatch > 1.0:
+            self._mapping_suspend_countdown = max(
+                int(getattr(self, "_mapping_suspend_countdown", 0)), 1
+            )
 
         view_angle_cmd_deg = float(-pitch_deg)
         for m in modules:
@@ -2754,14 +2814,15 @@ class SG_Nav_Agent():
             angle = angle.cpu().numpy()
         agent_gps = observations['gps']
         agent_compass = observations['compass']
-        # In the current Habitat-style gps/compass bridge, forward motion in gps space follows
-        # [sin(compass), cos(compass)]. Positive image angle means "to the right" of the optical
-        # axis, so we rotate the forward heading clockwise by +angle in that same convention.
-        goal_direction = agent_compass + angle / 180 * np.pi
+        # HTTP bridge uses OmniGibson ``z_angle_from_quat`` (+ optional runtime compass offset),
+        # so compass=0 aligns with world/map +x. Keep the legacy Habitat/ObjectNav convention here:
+        # forward = [cos(compass), -sin(compass)] in (gps_x, gps_y), and a positive image angle
+        # means the detection lies to the camera's right, i.e. rotate the forward heading clockwise.
+        goal_direction = agent_compass - angle / 180 * np.pi
         goal_gps = np.array(
             [
-                (agent_gps[0] + np.sin(goal_direction) * distance).item(),
-                (agent_gps[1] + np.cos(goal_direction) * distance).item(),
+                (agent_gps[0] + np.cos(goal_direction) * distance).item(),
+                (agent_gps[1] - np.sin(goal_direction) * distance).item(),
             ]
         )
         return goal_gps
@@ -3757,11 +3818,31 @@ class SG_Nav_Agent():
         return traversible, start_plan, start_o
 
     def _world_xy_m_to_grid_rc_for_nav(self, tx: float, ty: float) -> tuple[int, int]:
-        """Map grid (row, col) from world meters; same convention as ``get_traversible`` start (gx1=gy1=0)."""
-        start_y = float(self.map_size_cm) / 100.0 - float(ty)
-        start_x = float(tx)
-        r = int(round(start_y * 100.0 / float(self.map_resolution)))
-        c = int(round(start_x * 100.0 / float(self.map_resolution)))
+        """
+        Map grid (row, col) from absolute world meters.
+
+        Keep this in the exact same raw-map convention as:
+        - ``get_traversible()``'s ``start_raw_pose``
+        - ``_goal_gps_to_raw_goal_map_rc()``
+
+        For the HTTP client, ``world_xy`` is absolute OmniGibson world position while
+        ``goal_gps`` is map-centered Habitat-style coordinates:
+
+          gps_x = world_x - half_map_m
+          gps_y = half_map_m - world_y
+
+        Feeding that through ``_goal_gps_to_raw_goal_map_rc()`` lands on:
+
+          row = world_y / cell_size
+          col = world_x / cell_size
+
+        The previous implementation used ``map_size - world_y`` for the row, which
+        vertically mirrored ``target_world_xy`` goals versus every other navigation
+        target source. That made ``gt_world_on_map`` plan toward the wrong cell.
+        """
+        cell_m = float(self.map_resolution) / 100.0
+        r = int(round(float(ty) / cell_m))
+        c = int(round(float(tx) / cell_m))
         return (
             max(0, min(self.map_size - 1, r)),
             max(0, min(self.map_size - 1, c)),
@@ -3851,46 +3932,61 @@ class SG_Nav_Agent():
         )
         samples = max(1, int(self._forward_guard_samples))
         theta = math.radians(float(start_o))
-        dr = math.sin(theta)
-        dc = math.cos(theta)
         clear_radius_cells = int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0))
+        cone_half_deg = float(getattr(self, "_forward_guard_cone_half_angle_deg", 25.0))
+
+        # Check a fan of rays spanning [-cone_half_deg, +cone_half_deg] around heading.
+        n_rays = max(3, int(cone_half_deg / 5.0) * 2 + 1)
+        ray_angles = [
+            theta + math.radians(cone_half_deg * (2.0 * i / max(n_rays - 1, 1) - 1.0))
+            for i in range(n_rays)
+        ]
 
         for k in range(1, samples + 1):
             dist_cells = max(1, int(round(float(k) * lookahead_cells / float(samples))))
             if dist_cells <= clear_radius_cells:
                 continue
-            rr = int(round(sy + dr * dist_cells))
-            cc = int(round(sx + dc * dist_cells))
-            if rr < 0 or rr >= obs.shape[0] or cc < 0 or cc >= obs.shape[1]:
-                info = {
-                    "block_rc": (rr, cc),
-                    "block_type": "oob",
-                    "sample_idx": int(k),
-                    "dist_cells": int(dist_cells),
-                    "lookahead_cells": int(lookahead_cells),
-                    "samples": int(samples),
-                    "frame_mode": str(getattr(self, "_last_traversible_frame_mode", "id")),
-                }
-                return True, info
-            hit_obs = bool(obs[rr, cc])
-            hit_non_tr = not bool(tr[rr, cc])
-            if hit_obs or hit_non_tr:
-                if hit_obs and hit_non_tr:
-                    btype = "obs+non_traversible"
-                elif hit_obs:
-                    btype = "obs"
-                else:
-                    btype = "non_traversible"
-                info = {
-                    "block_rc": (int(rr), int(cc)),
-                    "block_type": btype,
-                    "sample_idx": int(k),
-                    "dist_cells": int(dist_cells),
-                    "lookahead_cells": int(lookahead_cells),
-                    "samples": int(samples),
-                    "frame_mode": str(getattr(self, "_last_traversible_frame_mode", "id")),
-                }
-                return True, info
+            for ray_idx, ray_theta in enumerate(ray_angles):
+                dr = math.sin(ray_theta)
+                dc = math.cos(ray_theta)
+                rr = int(round(sy + dr * dist_cells))
+                cc = int(round(sx + dc * dist_cells))
+                if rr < 0 or rr >= obs.shape[0] or cc < 0 or cc >= obs.shape[1]:
+                    info = {
+                        "block_rc": (rr, cc),
+                        "block_type": "oob",
+                        "sample_idx": int(k),
+                        "ray_idx": int(ray_idx),
+                        "n_rays": int(n_rays),
+                        "cone_half_deg": float(cone_half_deg),
+                        "dist_cells": int(dist_cells),
+                        "lookahead_cells": int(lookahead_cells),
+                        "samples": int(samples),
+                        "frame_mode": str(getattr(self, "_last_traversible_frame_mode", "id")),
+                    }
+                    return True, info
+                hit_obs = bool(obs[rr, cc])
+                hit_non_tr = not bool(tr[rr, cc])
+                if hit_obs or hit_non_tr:
+                    if hit_obs and hit_non_tr:
+                        btype = "obs+non_traversible"
+                    elif hit_obs:
+                        btype = "obs"
+                    else:
+                        btype = "non_traversible"
+                    info = {
+                        "block_rc": (int(rr), int(cc)),
+                        "block_type": btype,
+                        "sample_idx": int(k),
+                        "ray_idx": int(ray_idx),
+                        "n_rays": int(n_rays),
+                        "cone_half_deg": float(cone_half_deg),
+                        "dist_cells": int(dist_cells),
+                        "lookahead_cells": int(lookahead_cells),
+                        "samples": int(samples),
+                        "frame_mode": str(getattr(self, "_last_traversible_frame_mode", "id")),
+                    }
+                    return True, info
         return False, None
 
     def _plan(self, traversible, goal_map, agent_pose, start, start_o, goal_found):
@@ -3918,17 +4014,23 @@ class SG_Nav_Agent():
                 self.former_collide += 1
                 painted = []
                 newly_marked = 0
+                lateral_width = 2
+                cos_t = np.cos(np.deg2rad(t1))
+                sin_t = np.sin(np.deg2rad(t1))
+                perp_cos = -sin_t
+                perp_sin = cos_t
                 for i in range(length):
-                    wx = x1 + 0.05 * ((i + buf) * np.cos(np.deg2rad(t1)))
-                    wy = y1 + 0.05 * ((i + buf) * np.sin(np.deg2rad(t1)))
-                    r, c = wy, wx
-                    r = int(round(r * 100 / self.map_resolution))
-                    c = int(round(c * 100 / self.map_resolution))
-                    [r, c] = pu.threshold_poses([r, c], self.collision_map.shape)
-                    if self.collision_map[r, c] <= 0.5:
-                        newly_marked += 1
-                    painted.append((int(r), int(c)))
-                    self.collision_map[r,c] = 1
+                    for lat in range(-lateral_width, lateral_width + 1):
+                        wx = x1 + 0.05 * ((i + buf) * cos_t + lat * perp_cos)
+                        wy = y1 + 0.05 * ((i + buf) * sin_t + lat * perp_sin)
+                        r, c = wy, wx
+                        r = int(round(r * 100 / self.map_resolution))
+                        c = int(round(c * 100 / self.map_resolution))
+                        [r, c] = pu.threshold_poses([r, c], self.collision_map.shape)
+                        if self.collision_map[r, c] <= 0.5:
+                            newly_marked += 1
+                        painted.append((int(r), int(c)))
+                        self.collision_map[r,c] = 1
                 if getattr(self, "_log_collision_paint", False):
                     uniq = sorted(set(painted))
                     if len(uniq) > 0:
@@ -4102,6 +4204,8 @@ class SG_Nav_Agent():
                         f"rel_deg={float(relative_angle):.2f} "
                         f"block_rc=({br},{bc}) block_type={btype} "
                         f"sample_idx={fg_info.get('sample_idx')} dist_cells={fg_info.get('dist_cells')} "
+                        f"ray_idx={fg_info.get('ray_idx')} n_rays={fg_info.get('n_rays')} "
+                        f"cone_half_deg={fg_info.get('cone_half_deg')} "
                         f"lookahead_cells={fg_info.get('lookahead_cells')} samples={fg_info.get('samples')} "
                         f"frame={fg_info.get('frame_mode')} turn_pick={turn_pick}",
                         flush=True,
