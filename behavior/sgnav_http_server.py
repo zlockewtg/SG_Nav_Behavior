@@ -353,18 +353,27 @@ def main():
         default=os.path.join(REPO_ROOT, "configs/sgnav_minimal.rgbd.yaml"),
     )
     parser.add_argument("--visualize", action="store_true")
-    parser.add_argument("--warmup", action="store_true")
-    parser.add_argument("--warmup-runs", type=int, default=2)
+    parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=None,
+                        help="CUDA warmup on startup (default: from yaml, fallback true)")
+    parser.add_argument("--warmup-runs", type=int, default=None,
+                        help="warmup iterations (default: from yaml, fallback 2)")
     args = parser.parse_args()
 
     sys.path.insert(0, REPO_ROOT)
     os.chdir(REPO_ROOT)
+
+    from omegaconf import OmegaConf
+    _cfg_for_defaults = OmegaConf.load(args.config)
+    _rt = _cfg_for_defaults.get("SGNAV_RUNTIME", {}) or {}
+    warmup_flag = args.warmup if args.warmup is not None else bool(_rt.get("warmup", True))
+    warmup_runs = args.warmup_runs if args.warmup_runs is not None else max(1, int(_rt.get("warmup_runs", 2)))
+
     nav_args = argparse.Namespace(
         visualize=bool(args.visualize),
         split_l=-1,
         split_r=-1,
-        warmup=bool(args.warmup),
-        warmup_runs=max(1, int(args.warmup_runs)),
+        warmup=warmup_flag,
+        warmup_runs=warmup_runs,
     )
     _AgentHolder.config_path = args.config
     SGNavHTTPHandler.cfg_path = args.config
@@ -379,7 +388,8 @@ def main():
             "vid_XXXXXX.mp4 on next /reset, at 500 steps, or server shutdown.",
             flush=True,
         )
-    if args.warmup:
+    # Must use warmup_flag: args.warmup stays None unless --warmup/--no-warmup is passed.
+    if warmup_flag:
         started = _start_background_warmup(args.config, nav_args, nav_args.warmup_runs)
         if started:
             print(

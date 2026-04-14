@@ -81,6 +81,10 @@ class SG_Nav_Agent():
         self.total_steps = 0
         self.found_goal = False
         self.found_goal_times = 0
+        self._face_goal_pending = False
+        self._face_goal_gps = None
+        self._face_goal_turn_steps = 0
+        self._face_goal_max_turn_steps = 20
         # Goal confirmation distance in meters. Keep env-tunable for different camera/depth setups.
         runtime_cfg = {}
         if hasattr(task_config, "get"):
@@ -150,6 +154,19 @@ class SG_Nav_Agent():
         self.rooms_captions = rooms_captions
         self.split = (self.args.split_l >= 0)
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
+
+        _bert_path = _runtime_get("bert_base_uncased_path", "") or ""
+        if isinstance(_bert_path, str) and _bert_path.strip():
+            _bp = os.path.abspath(os.path.expanduser(_bert_path.strip()))
+            if os.path.isdir(_bp):
+                os.environ["SGNAV_BERT_BASE_UNCASED_PATH"] = _bp
+                print(f"[SG-Nav][bert] local pretrained: {_bp}", flush=True)
+            else:
+                print(
+                    f"[SG-Nav][bert] bert_base_uncased_path is not a directory ({_bp}); "
+                    "using Hugging Face Hub",
+                    flush=True,
+                )
 
         ### ------ init glip model ------ ###
         config_file = "GLIP/configs/pretrain/glip_Swin_L.yaml" 
@@ -858,6 +875,9 @@ class SG_Nav_Agent():
         self._last_goal_map_src_effective = None
         self._possible_goal_stop_streak = 0
         self._possible_goal_escape_cooldown = 0
+        self._face_goal_pending = False
+        self._face_goal_gps = None
+        self._face_goal_turn_steps = 0
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
         if object_category is not None:
             self.obj_goal = object_category
@@ -946,6 +966,8 @@ class SG_Nav_Agent():
             return "goal_driven_nav", "目标驱动导航"
         if effective_src == "gt_world_on_map" or getattr(self, "_active_gt_world_nav", False):
             return "goal_driven_nav", "目标驱动导航"
+        if effective_src == "face_goal_pending" or getattr(self, "_face_goal_pending", False):
+            return "goal_driven_nav", "目标朝向对齐"
         if self.found_possible_goal or effective_src == "possible_goal":
             return "possible_goal_nav", "疑似目标导航"
         if "frontier" in effective_src:
@@ -1054,6 +1076,8 @@ class SG_Nav_Agent():
         possible_goal_allowed = (
             int(getattr(self, "_possible_goal_escape_cooldown", 0)) <= 0
         )
+        # Match ``goal_gps_to_map_rc`` in utils/geometry.py (half map in cells).
+        half_cells = float(self.map_size_cm) / 10.0
 
         for j, label in enumerate(obj_labels):
             if label in CANONICAL_MP3D_GOAL_ORDER:
@@ -1065,8 +1089,8 @@ class SG_Nav_Agent():
                 if temp_distance >= self.distance_threshold:
                     continue
                 obj_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
-                x = int(self.map_size_cm/10-obj_gps[1]*100/self.resolution)
-                y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
+                x = int(half_cells - obj_gps[1] * 100 / self.resolution)
+                y = int(half_cells + obj_gps[0] * 100 / self.resolution)
                 self.obj_locations[CANONICAL_MP3D_GOAL_ORDER.index(label)].append([confidence, x, y])
         
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
@@ -1377,6 +1401,13 @@ class SG_Nav_Agent():
             goal_map_src = "found_goal"
         elif self._try_apply_gt_world_target_goal_map(observations):
             goal_map_src = "gt_world_on_map"
+        elif self._face_goal_pending and self._face_goal_gps is not None:
+            self._active_gt_world_nav = False
+            self.not_use_random_goal()
+            self.goal_map = np.zeros(self.full_map.shape[-2:])
+            goal_r, goal_c = self._goal_gps_to_raw_goal_map_rc(self._face_goal_gps)
+            self.goal_map[goal_r, goal_c] = 1
+            goal_map_src = "face_goal_pending"
         elif self.found_possible_goal:
             self._active_gt_world_nav = False
             self.not_use_random_goal()
@@ -1447,6 +1478,7 @@ class SG_Nav_Agent():
                 not self.found_goal
                 and not self.found_possible_goal
                 and not self._active_gt_world_nav
+                and not self._face_goal_pending
                 and number_action == 0
             )
             or (self.using_random_goal and self.move_since_random > 20)
@@ -1482,10 +1514,14 @@ class SG_Nav_Agent():
                 traversible, goal_map_plan, self.full_pose, cur_start, cur_start_o, self.found_goal
             )
         
-        # Treat a planner STOP while we still have a semantic target as goal-side behavior,
+        # Treat a planner STOP/TURN while we still have a semantic target as goal-side behavior,
         # not as exploration deadlock. Without this guard, brief alignment / near-goal stops
         # can accumulate ``not_move_steps`` and incorrectly trigger random recovery.
-        if self.found_goal and goal_map_src == "found_goal" and number_action == 0:
+        if (
+            (self.found_goal and goal_map_src == "found_goal")
+            or (self._active_gt_world_nav and goal_map_src == "gt_world_on_map")
+            or self._face_goal_pending
+        ):
             self.not_move_steps = 0
 
         possible_goal_escape_hit = False
@@ -1546,6 +1582,7 @@ class SG_Nav_Agent():
             not self.found_goal
             and not self.found_possible_goal
             and not self._active_gt_world_nav
+            and not self._face_goal_pending
         )
         self.loop_time = 0
         stuck_reset_hit = False
@@ -1830,6 +1867,23 @@ class SG_Nav_Agent():
         if goal_gps is None:
             goal_gps = getattr(self, "goal_gps", None)
         return _get_goal_stop_status_impl(agent_pose, goal_gps, self.map_size_cm)
+
+    def _get_face_goal_stop_state(self, agent_pose):
+        """Resolve the best available goal GPS for face-goal override.
+
+        Priority: active goal from goal_map > saved face-goal GPS from
+        a previous turn step > self.goal_gps.  Returns the stop-status
+        dict with an extra ``_goal_gps`` key so the caller can persist it.
+        """
+        goal_gps = self._get_active_goal_gps()
+        if goal_gps is None:
+            goal_gps = getattr(self, "_face_goal_gps", None)
+        if goal_gps is None:
+            goal_gps = getattr(self, "goal_gps", None)
+        result = _get_goal_stop_status_impl(agent_pose, goal_gps, self.map_size_cm)
+        if result is not None and goal_gps is not None:
+            result["_goal_gps"] = np.asarray(goal_gps, dtype=np.float32).copy()
+        return result
    
     def init_map(self):
         self.map_size = self.map_size_cm // self.map_resolution
@@ -2448,8 +2502,13 @@ class SG_Nav_Agent():
             else:
                 self.former_collide = 0
 
-        stg, replan, stop, = self._get_stg(traversible, start, np.copy(goal_map), goal_found)
-        goal_stop_state = self._get_goal_stop_status(agent_pose) if goal_found else None
+        should_face_goal = (
+            goal_found
+            or bool(getattr(self, "_active_gt_world_nav", False))
+            or bool(getattr(self, "_face_goal_pending", False))
+        )
+        stg, replan, stop, = self._get_stg(traversible, start, np.copy(goal_map), goal_found, should_face_goal)
+        goal_stop_state = self._get_face_goal_stop_state(agent_pose) if should_face_goal else None
         goal_stop_override = False
 
         # Deterministic Local Policy
@@ -2576,7 +2635,7 @@ class SG_Nav_Agent():
                         turn_pick = "default_right"
 
         if (
-            goal_found
+            should_face_goal
             and goal_stop_state is not None
             and goal_stop_state["distance_m"] <= float(self._goal_stop_distance_threshold_m)
         ):
@@ -2585,16 +2644,26 @@ class SG_Nav_Agent():
                 goal_stop_state["distance_m"] <= 1e-3
                 or abs(goal_stop_state["heading_error_deg"])
                 <= float(self._goal_stop_face_threshold_deg)
+                or self._face_goal_turn_steps >= self._face_goal_max_turn_steps
             ):
                 action = 0
+                self._face_goal_pending = False
+                self._face_goal_gps = None
+                self._face_goal_turn_steps = 0
             elif goal_stop_state["heading_error_deg"] > 0:
                 action = 2
+                self._face_goal_pending = True
+                self._face_goal_gps = goal_stop_state.get("_goal_gps")
+                self._face_goal_turn_steps += 1
             else:
                 action = 3
+                self._face_goal_pending = True
+                self._face_goal_gps = goal_stop_state.get("_goal_gps")
+                self._face_goal_turn_steps += 1
 
         return stg_y, stg_x, replan, action
     
-    def _get_stg(self, traversible, start, goal, goal_found):
+    def _get_stg(self, traversible, start, goal, goal_found, should_face_goal=False):
         def add_boundary(mat, value=1):
             h, w = mat.shape
             new_mat = np.zeros((h+2,w+2)) + value
@@ -2609,7 +2678,7 @@ class SG_Nav_Agent():
             goal, centers = CH._get_center_goal(goal)
         state = [start[0] + 1, start[1] + 1]
         self.planner = FMMPlanner(traversible, None, step_size=self._fmm_step_size)
-        if goal_found:
+        if goal_found or should_face_goal:
             self.planner.stop_cond = max(
                 0.05, float(self._goal_stop_distance_threshold_m)
             )

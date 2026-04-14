@@ -16,6 +16,7 @@ from .collate_batch import BatchCollator, BBoxAugCollator
 from .transforms import build_transforms
 
 from transformers import AutoTokenizer
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 from .datasets.duplicate_dataset import create_duplicate_dataset
 
 def build_dataset(cfg, dataset_list, transforms, dataset_catalog, is_train=True, class_concat=False, extra_args={}):
@@ -405,7 +406,9 @@ def make_data_loader(cfg, is_train=True, is_distributed=False, num_replicas=None
         else:
             extra_args["tokenizer"] = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32", from_slow=True)
     else:
-        extra_args['tokenizer'] = AutoTokenizer.from_pretrained(cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE)
+        extra_args["tokenizer"] = AutoTokenizer.from_pretrained(
+            resolve_bert_pretrained_id(cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE)
+        )
 
     if isinstance(dataset_list[0], (tuple, list)):
         datasets = build_dataset_by_group(dataset_list, transforms, DatasetCatalog, is_train,

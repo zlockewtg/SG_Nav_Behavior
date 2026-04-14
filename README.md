@@ -88,6 +88,7 @@ conda install -c pytorch faiss-gpu=1.8.0
 pip install torch==1.9.1+cu111 torchvision==0.10.1+cu111 -f https://download.pytorch.org/whl/torch_stable.html
 pip install -r requirements.txt
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+huggingface-cli download google-bert/bert-base-uncased --local-dir models/bert-base-uncased
 ```
 
 Install Grounded SAM.

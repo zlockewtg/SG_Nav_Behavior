@@ -17,6 +17,7 @@ from ..roi_heads import build_roi_heads
 
 from ..language_backbone import build_language_backbone
 from transformers import AutoTokenizer
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 
 import random
 import timeit
@@ -89,7 +90,9 @@ class GeneralizedVLRCNN(nn.Module):
                 self.tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
                                                                             from_slow=True)
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                resolve_bert_pretrained_id(cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE)
+            )
         self.tokenizer_vocab = self.tokenizer.get_vocab()
         self.tokenizer_vocab_ids = [item for key, item in self.tokenizer_vocab.items()]
 

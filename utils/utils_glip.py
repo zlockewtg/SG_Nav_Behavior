@@ -42,6 +42,7 @@ categories_21.append('radio')
 categories_21.append('vidalia onion')
 categories_21.append('parer')
 categories_21.append('bowl')
+categories_21.append('microwave')
 # categories_21.append('treadmill')
 # categories_21.append('exercise machine')
 object_captions = '. '.join(categories_21) +'.'# version 1

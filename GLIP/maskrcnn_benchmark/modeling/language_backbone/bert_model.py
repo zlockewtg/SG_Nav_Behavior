@@ -5,6 +5,7 @@ from torch import nn
 
 # from pytorch_pretrained_bert.modeling import BertModel
 from transformers import BertConfig, RobertaConfig, RobertaModel, BertModel
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 
 
 class BertEncoder(nn.Module):
@@ -15,9 +16,12 @@ class BertEncoder(nn.Module):
         print("LANGUAGE BACKBONE USE GRADIENT CHECKPOINTING: ", self.cfg.MODEL.LANGUAGE_BACKBONE.USE_CHECKPOINT)
 
         if self.bert_name == "bert-base-uncased":
-            config = BertConfig.from_pretrained(self.bert_name)
+            bert_src = resolve_bert_pretrained_id(self.bert_name)
+            config = BertConfig.from_pretrained(bert_src)
             config.gradient_checkpointing = self.cfg.MODEL.LANGUAGE_BACKBONE.USE_CHECKPOINT
-            self.model = BertModel.from_pretrained(self.bert_name, add_pooling_layer=False, config=config)
+            self.model = BertModel.from_pretrained(
+                bert_src, add_pooling_layer=False, config=config
+            )
             self.language_dim = 768
         elif self.bert_name == "roberta-base":
             config = RobertaConfig.from_pretrained(self.bert_name)

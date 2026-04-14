@@ -1,6 +1,8 @@
-# Minimal OmegaConf for SG_Nav_Agent without running a Habitat Env.
-# Use: OmegaConf.load / habitat.get_config — same structure Habitat tasks expect.
+# ──────────────────────────────────────────────────────────────
+# SG-Nav minimal config for OmniGibson / HTTP server
+# ──────────────────────────────────────────────────────────────
 
+# ── Simulator geometry (must match OmniGibson sensor config) ──
 SIMULATOR:
   TURN_ANGLE: 20
   TILT_ANGLE: 30
@@ -32,42 +34,105 @@ DATASET:
   DATA_PATH: ""
   SCENES_DIR: ""
 
+# ──────────────────────────────────────────────────────────────
+# SG-Nav runtime parameters
+# ──────────────────────────────────────────────────────────────
 SGNAV_RUNTIME:
-  visualize_centered_crop_ratio: 0.3
-  # HTTP camera_pose_world fallback height (cm) when the client pose is absent/disabled.
-  camera_height_fallback_cm: 100.0
+
+  # ── Server / startup ──────────────────────────────────────
+  warmup: true
+  warmup_runs: 2
+  # Optional: local HF snapshot dir for bert-base-uncased (tokenizer + config + weights).
+  # Empty = load from Hugging Face Hub (needs network or existing cache).
+  # One-time download example:
+  #   huggingface-cli download google-bert/bert-base-uncased --local-dir models/bert-base-uncased
+  # Or: python -c "from huggingface_hub import snapshot_download; snapshot_download('bert-base-uncased', local_dir='models/bert-base-uncased')"
+  # Then set (paths relative to SG-Nav cwd): bert_base_uncased_path: "models/bert-base-uncased"
+  # Override without yaml: export SGNAV_BERT_BASE_UNCASED_PATH=/abs/path/to/bert-base-uncased
+  bert_base_uncased_path: "/mnt/public/tgy/SG-Nav/models/bert-base-uncased" # models/bert-base-uncased
+
+  # ── Coordinate transform ──────────────────────────────────
+  # Depth wedge → robot forward offset (Semantic_Mapping uses heading−90°).
+  compass_offset_deg: -90.0
+  map_frame_fixed_mode: flipud
+
+  # ── Map construction thresholds ───────────────────────────
+  map_size_cm: 6000
+  # First gps after /reset is episode origin so the agent starts at global map center on the grid.
+  gps_episode_rebase: true
+  sem_map_pred_threshold: 2.0
+  sem_exp_pred_threshold: 2.5
+  free_map_pred_threshold: 0.5
+  free_exp_pred_threshold: 0.5
+
+  # ── Camera extrinsics (from OG camera_pose_world) ────────
   camera_tilt_source: cam_z_down
-  # Depth->map vertical bands (cm).
-  map_obstacle_min_z_cm: 25.0
+  camera_height_fallback_cm: 100.0
   camera_pitch_min_deg: -45.0
   camera_pitch_max_deg: 45.0
   camera_height_min_cm: 120.0
+  camera_height_max_cm: 220.0
   camera_height_reject_min_cm: 120.0
+  camera_height_reject_max_cm: 210.0
   camera_extrinsic_reject_motion_delta: true
   camera_pitch_reject_delta_deg: 6.0
   camera_height_reject_delta_cm: 8.0
-  log_camera_pose_world: true
-  # Pause depth->map fusion for a few steps when collision coincides with a fallen / abnormal camera pose.
+
+  # ── Depth→map vertical bands (cm) ────────────────────────
+  map_obstacle_min_z_cm: 25.0
+  map_free_min_z_cm: -150.0
+  map_free_max_z_cm: 25.0
+
+  # ── Mapping suspension on fall / collision ────────────────
   map_suspend_on_fall: true
   map_suspend_steps_on_fall: 4
   map_suspend_roll_deg: 85.0
   map_suspend_pitch_deg: 50.0
   map_suspend_height_cm: 95.0
   map_suspend_height_delta_cm: 20.0
-  # Tune this when depth wedge orientation drifts sideways versus real robot forward.
-  compass_offset_deg: -90.0
-  # If target_world_xy is available and already lies on explored occupancy, plan directly to it.
+
+  # ── Traversible generation ────────────────────────────────
+  traversible_obstacle_inflation_m: 0.15
+  traversible_occ_from_depth_min: 0.45
+  traversible_clear_robot_obs_enable: true
+  traversible_clear_robot_obs_radius_m: 1.0
+  traversible_free_map_min: 0.25
+  traversible_bootstrap_enable: true
+  traversible_bootstrap_min_free_ratio: 0.002
+  traversible_bootstrap_radius_m: 0.9
+
+  # ── FMM planner ───────────────────────────────────────────
+  planner_align_angle_deg: 30.0
+  planner_align_hysteresis_deg: 5.0
+  planner_face_goal_max_error_deg: 30.0
+  fmm_step_size: 3
+  fmm_stop_cond: 1.0
+  collision_threshold_m: 0.08
+
+  # ── Goal approach / stop ──────────────────────────────────
+  goal_distance_threshold: 8.0
+  goal_stop_distance_threshold_m: 0.3
+  goal_stop_face_threshold_deg: 12.0
   gt_pathplan_when_target_on_map: true
-  # HTTP server ignores these; eval script reads them as branch-specific movement defaults.
-  # behavior_base_action_mode: position
-  # Velocity branch defaults.
+  panorama_spin_until_step: 22
+
+  # ── GLIP / Scene Graph ────────────────────────────────────
+  detect_interval: 5
+  scenegraph_update_interval: 5
+  show_frame_nodes_only: true
+  glip_append_goal_sg: true
+  save_scenegraph_json: false
+
+  # ── Visualization ─────────────────────────────────────────
+  visualize_centered_crop_ratio: 0.3
+  # Shift occupancy panel so episode-start robot cell is at (map_size//2, map_size//2); planning unchanged.
+  visualize_align_start_to_map_center: true
+
+  # ── OmniGibson eval_skill movement defaults ───────────────
+  # (read by eval script, not SG_Nav.py)
   behavior_forward_vel: 0.5
   behavior_turn_vel: 1.75
-  behavior_velocity_forward_vel: 0.5
-  behavior_velocity_turn_vel: 1.75
   behavior_physics_steps_per_nav_step: 2
-  # Position branch defaults. Keep these much more conservative than velocity mode because
-  # absolute base deltas can destabilize the robot more easily in OmniGibson physics.
   behavior_position_forward_step_size_m: 0.02
   behavior_position_turn_angle_deg: 5
   behavior_position_physics_steps_per_nav_step: 1
@@ -75,51 +140,8 @@ SGNAV_RUNTIME:
   behavior_position_turn_physics_steps_per_nav_step: 11
   behavior_position_physical_look_pitch_step_deg: 5
   behavior_look_pitch_sign: -1
-  # Keep a small buffer from the physical trunk pitch joint limits so repeated LOOK_UP / LOOK_DOWN
-  # during navigation cannot drive the head too close to the mechanical extremes.
   behavior_physical_look_pitch_limit_margin_deg: 10
-  # Traversible obstacle inflation in meters.
-  traversible_obstacle_inflation_m: 0.15
-  traversible_obstacle_disk_radius: 2
-  traversible_occ_from_depth_min: 0.45
-  traversible_clear_robot_obs_radius_m: 1
-  traversible_clear_robot_obs_enable: true
-  traversible_require_explored: false
-  traversible_free_map_min: 0.25
-  map_frame_fixed_mode: flipud
-  sem_map_pred_threshold: 2.0
-  sem_exp_pred_threshold: 2.5
-  # full_map diagnosis toggles: enable only one at a time against the same route/seed.
-  diag_freeze_camera_extrinsics: false
-  diag_disable_pose_bridge: false
-  # current | legacy_strict
-  diag_sem_threshold_profile: current
-  # nearest | bilinear
-  diag_map_warp_mode: nearest
-  traversible_bootstrap_enable: true
-  traversible_bootstrap_min_free_ratio: 0.002
-  traversible_bootstrap_radius_m: 0.9
-  collision_threshold_m: 0.08
-  # Optional: VisionSensor native horizontal_aperture (unset = OmniGibson default for the robot).
-  # behavior_vision_horizontal_aperture: 40.0
-  detect_interval: 5
-  scenegraph_update_interval: 5
-  planner_align_angle_deg: 30
-  planner_align_hysteresis_deg: 5.0
-  planner_face_goal_max_error_deg: 30.0
-  panorama_spin_until_step: 22
-  fmm_step_size: 3
-  fmm_stop_cond: 1
-  goal_stop_distance_threshold_m: 0.3
-  goal_stop_face_threshold_deg: 12.0
-  nav_debug_trace: true
-  log_pose_align_trace: true
-  log_goal_cell_drift: true
-  goal_distance_threshold: 8.0
-  save_scenegraph_json: false
-  show_frame_nodes_only: true
-  glip_append_goal_sg: true
-  # Extra GLIP phrases (comma/semicolon). Logs showed bbox=0 when labels were only table/picture —
-  # add synonyms so detections can map to goal match_tokens (radio / receiver).
+
+  # ── Scene-graph edge LLM ──────────────────────────────────
   scenegraph:
     skip_edge_llm: false

@@ -234,9 +234,12 @@ def create_queries_and_maps(labels, label_list, additional_labels = None, cfg = 
     print(objects_query)
 
     from transformers import AutoTokenizer
-    # tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
+
     if cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "bert-base-uncased":
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained(
+            resolve_bert_pretrained_id("bert-base-uncased")
+        )
         tokenized = tokenizer(objects_query, return_tensors="pt")
     elif cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "clip":
         from transformers import CLIPTokenizerFast

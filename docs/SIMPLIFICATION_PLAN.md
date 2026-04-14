@@ -330,7 +330,7 @@ Episode 重置和初始化也写入同一文件：
 | flipud mirror 启发法 | ~40 行 | 从未启用 |
 | `_diag_full_map_any_toggle` 及相关 | ~20 行 | 简化诊断 |
 
-**预计删除 ~800-1000 行代码，精简 `__init__` 约 60%。**
+**已完成：5023 行 → 2774 行（减少 45%），同时抽取 4 个 utils 模块。**
 
 ---
 
@@ -416,13 +416,15 @@ SG_Nav.py  (~3800 行，减少约 25%)
 
 ---
 
-## 八、实施顺序建议
+## 八、实施状态
 
-1. **新建 `NavLogger` 类** — 统一 JSON 写入器，替代 25+ 个 print
-2. **删除 dead code** — PSL、main()、SG_Nav_0.py、_auto_select、mirror 等
-3. **精简 `__init__`** — 硬编码 90 个参数，仅保留 30 个从 YAML 读取
-4. **替换所有 print** — 改为写入 NavLogger，仅保留 `[SG-Nav][stage]`
-5. **删除脚本化相机控制** — act() 中 steps 1-16 的 LOOK/TURN
-6. **删除 OG occupancy 融合**
-7. **精简 YAML 文件**
-8. **测试验证** — 用 HTTP 服务器端到端跑一轮确认功能正常
+- [x] 新建 `utils/nav_logger.py` — 统一 JSON 写入器
+- [x] 新建 `utils/geometry.py` — 坐标变换、角度工具
+- [x] 新建 `utils/camera_pose.py` — 相机外参同步
+- [x] 新建 `utils/nav_visualization.py` — 可视化、视频保存
+- [x] 删除 dead code — PSL、main()、_auto_select、debug dump 等
+- [x] 精简 `__init__` — 移除 18 个死日志标志
+- [x] 替换所有 print — 38 → 4（init 3 + `[SG-Nav][stage]` 1）
+- [x] 精简 YAML 配置 — 移除死参数，分组注释
+- [x] warmup 默认开启 — YAML `warmup: true, warmup_runs: 2`，server 自动读取
+- [ ] 测试验证 — 用 HTTP 服务器端到端跑一轮确认功能正常

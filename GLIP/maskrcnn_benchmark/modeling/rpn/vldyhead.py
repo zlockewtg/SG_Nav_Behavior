@@ -24,6 +24,7 @@ import pdb
 
 from maskrcnn_benchmark.modeling.language_backbone.clip_model import QuickGELU, LayerNorm, DropPath
 from timm.models.layers import DropPath, trunc_normal_
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 
 class h_sigmoid(nn.Module):
     def __init__(self, inplace=True, h_max=1):
@@ -563,7 +564,9 @@ class VLDyHead(torch.nn.Module):
         self.cfg = cfg
         # bert_cfg = BertConfig.from_pretrained(cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE)
         if cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE == "bert-base-uncased":
-            lang_cfg = BertConfig.from_pretrained(cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE)
+            lang_cfg = BertConfig.from_pretrained(
+                resolve_bert_pretrained_id(cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE)
+            )
         elif cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE == "clip":
             lang_cfg = cfg
         else:
@@ -721,7 +724,9 @@ class VLDyHead(torch.nn.Module):
         
         if self.cfg.MODEL.DYHEAD.FUSE_CONFIG.MLM_LOSS:
             if cfg.MODEL.LANGUAGE_BACKBONE.MODEL_TYPE == "clip":
-                lang_cfg = BertConfig.from_pretrained("bert-base-uncased")
+                lang_cfg = BertConfig.from_pretrained(
+                    resolve_bert_pretrained_id("bert-base-uncased")
+                )
                 lang_cfg.hidden_size = cfg.MODEL.CLIP.WIDTH
                 lang_cfg.vocab_size = cfg.MODEL.CLIP.VOCAB_SIZE
             self.mlm_head = BertLMPredictionHead(

@@ -21,6 +21,7 @@ from maskrcnn_benchmark.utils.amp import custom_fwd, custom_bwd
 from maskrcnn_benchmark.utils.shallow_contrastive_loss_helper import *
 
 from transformers import AutoTokenizer
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 
 INF = 1e8
 
@@ -544,7 +545,9 @@ class ATSSLossComputation(torch.nn.Module):
                 self.tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
                                                                             from_slow=True)
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.lang)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                resolve_bert_pretrained_id(self.lang)
+            )
 
         # if use shallow contrastive loss
         if self.cfg.MODEL.DYHEAD.FUSE_CONFIG.USE_SHALLOW_CONTRASTIVE_LOSS \

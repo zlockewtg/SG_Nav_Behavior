@@ -6,6 +6,7 @@ from typing import List, Union
 import nltk
 import inflect
 from transformers import AutoTokenizer
+from utils.sgnav_bert_pretrained import resolve_bert_pretrained_id
 from torchvision import transforms as T
 
 from maskrcnn_benchmark.modeling.detector import build_detection_model
@@ -92,7 +93,9 @@ class GLIPDemo(object):
         cfg = self.cfg
         tokenizer = None
         if cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "bert-base-uncased":
-            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            tokenizer = AutoTokenizer.from_pretrained(
+                resolve_bert_pretrained_id("bert-base-uncased")
+            )
         elif cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "clip":
             from transformers import CLIPTokenizerFast
             if cfg.MODEL.DYHEAD.FUSE_CONFIG.MLM_LOSS:

@@ -8,6 +8,7 @@ glip_large_model.pth
 /GLIP/build
 /GLIP/maskrcnn_benchmark.egg-info
 /segment_anything/segment_anything.egg-info/
+/models
 *.so
 *.bak
 *.bak_*
