@@ -715,11 +715,30 @@ def _collect_scene_asset_hash_mismatches(scene) -> list[dict]:
 
 
 def _resolve_tro_export_path(base_path: str, task_name: str, instance_id: int) -> str:
+    """
+    Resolve where to write a tro_state export.
+
+    - Existing directory -> <dir>/<task>_instance_<id>_tro_state.json
+    - Existing regular file -> overwrite that path
+    - Path ends with .json and does not exist yet -> that file (parents created)
+    - Otherwise (typical ``.../tro_snapshots`` folder that does not exist yet) -> create as
+      directory and write the default-named json inside, so it matches ``--tro_state_path`` under
+      that folder.
+    """
     out = os.path.abspath(base_path)
+    safe_task = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(task_name).strip()) or "task"
+    default_name = f"{safe_task}_instance_{int(instance_id)}_tro_state.json"
     if os.path.isdir(out):
-        safe_task = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(task_name).strip()) or "task"
-        return os.path.join(out, f"{safe_task}_instance_{int(instance_id)}_tro_state.json")
-    return out
+        return os.path.join(out, default_name)
+    if os.path.isfile(out):
+        return out
+    if os.path.basename(out).lower().endswith(".json"):
+        parent = os.path.dirname(out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return out
+    os.makedirs(out, exist_ok=True)
+    return os.path.join(out, default_name)
 
 
 class SGNavHTTPClient:
@@ -953,6 +972,7 @@ class SGNavHTTPRunner:
         )
         self._current_tro_source_path: str | None = None
         self._current_tro_export_path: str | None = None
+        self._tro_load_failure_detail: str | None = None
         self._action_semantics_snapshot_logged = False
         self._settle_after_nav_action = bool(settle_after_nav_action)
         self._settle_max_steps = max(0, int(settle_max_steps))
@@ -1724,12 +1744,29 @@ class SGNavHTTPRunner:
         pose["source"] = str(used)
         return pose
 
+    def _robot_pose_registry_key(self) -> str:
+        """Key used inside tro_state['robot_poses']; matches OmniGibson BaseRobot.model_name when present."""
+        robot = self.robot
+        if robot is None:
+            return "R1Pro"
+        name = getattr(robot, "model_name", None)
+        if name is not None:
+            return str(name)
+        name = getattr(robot, "_model_name", None)
+        if name is not None:
+            return str(name)
+        cls_name = robot.__class__.__name__
+        return "R1Pro" if cls_name == "Robot" else cls_name
+
     def _reapply_tro_after_reset(self, tro_state: dict) -> None:
+        rk = self._robot_pose_registry_key()
         for tro_key, tro_data in tro_state.items():
             if tro_key == "robot_poses":
-                if self.robot.model_name in tro_data:
-                    rp = tro_data[self.robot.model_name][0]
+                if rk in tro_data:
+                    rp = tro_data[rk][0]
                     self.robot.set_position_orientation(rp["position"], rp["orientation"])
+            elif tro_key == "__tro_meta__":
+                continue
             elif tro_key in self.env.task.object_scope:
                 self.env.task.object_scope[tro_key].load_state(tro_data, serialized=False)
         if "robot_poses" in tro_state:
@@ -1737,8 +1774,12 @@ class SGNavHTTPRunner:
 
     def _build_current_tro_state_snapshot(self) -> dict:
         tro_state: dict = {}
+        tro_state["__tro_meta__"] = {
+            "task_name": str(getattr(self.env.task, "activity_name", "")),
+            "scene_name": str(getattr(self.env.task, "scene_name", "")),
+        }
         tro_state["robot_poses"] = {
-            str(self.robot.model_name): [
+            self._robot_pose_registry_key(): [
                 {
                     "position": list(self._to_python_scalar_or_list(self.robot.get_position_orientation()[0])),
                     "orientation": list(self._to_python_scalar_or_list(self.robot.get_position_orientation()[1])),
@@ -1933,7 +1974,9 @@ class SGNavHTTPRunner:
         if self.online_sampling:
             self._cached_tro_state = None
             self._current_tro_source_path = None
+            self._tro_load_failure_detail = None
             return True
+        self._tro_load_failure_detail = None
         if self._tro_state_path is not None:
             tro_file_path = self._tro_state_path
             tro_label = "explicit_path"
@@ -1953,6 +1996,16 @@ class SGNavHTTPRunner:
         if not os.path.exists(tro_file_path):
             self._cached_tro_state = None
             self._current_tro_source_path = os.path.abspath(tro_file_path)
+            detail = f"file_missing: {self._current_tro_source_path}"
+            parent = os.path.dirname(tro_file_path)
+            if parent and os.path.isfile(parent):
+                detail += (
+                    f" | hint: {parent} is a file (common when --save_tro_state_to pointed at a "
+                    "path that did not exist yet in an older script version). "
+                    f"Try: --tro_state_path {parent}"
+                )
+            self._tro_load_failure_detail = detail
+            logger.error("[eval_skill_sgnav_http][tro] %s", detail)
             return False
         self._current_tro_source_path = os.path.abspath(tro_file_path)
         print(
@@ -1967,16 +2020,47 @@ class SGNavHTTPRunner:
             tro_state = recursively_convert_to_torch(json.load(f))
         self._cached_tro_state = tro_state
 
+        rk = self._robot_pose_registry_key()
         for tro_key, tro_data in tro_state.items():
-            if tro_key == "robot_poses":
-                if self.robot.model_name not in tro_data:
+            if tro_key == "__tro_meta__":
+                tro_task_name = ""
+                if isinstance(tro_data, dict):
+                    tro_task_name = str(tro_data.get("task_name", "")).strip()
+                current_task_name = str(getattr(self.env.task, "activity_name", "")).strip()
+                if tro_task_name and current_task_name and tro_task_name != current_task_name:
                     self._cached_tro_state = None
+                    self._tro_load_failure_detail = (
+                        f"tro task mismatch: file task={tro_task_name!r}, current task={current_task_name!r}"
+                    )
+                    logger.error("[eval_skill_sgnav_http][tro] %s", self._tro_load_failure_detail)
                     return False
-                robot_pos = tro_data[self.robot.model_name][0]["position"]
-                robot_quat = tro_data[self.robot.model_name][0]["orientation"]
+                continue
+            if tro_key == "robot_poses":
+                if rk not in tro_data:
+                    self._cached_tro_state = None
+                    keys = list(tro_data.keys()) if isinstance(tro_data, dict) else []
+                    self._tro_load_failure_detail = (
+                        f"robot_poses missing key {rk!r}; available keys={keys}"
+                    )
+                    logger.error("[eval_skill_sgnav_http][tro] %s", self._tro_load_failure_detail)
+                    return False
+                robot_pos = tro_data[rk][0]["position"]
+                robot_quat = tro_data[rk][0]["orientation"]
                 self.robot.set_position_orientation(robot_pos, robot_quat)
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_data)
             else:
+                if tro_key not in self.env.task.object_scope:
+                    self._cached_tro_state = None
+                    meta_task = ""
+                    if isinstance(tro_state.get("__tro_meta__"), dict):
+                        meta_task = str(tro_state["__tro_meta__"].get("task_name", "")).strip()
+                    self._tro_load_failure_detail = (
+                        f"tro object key {tro_key!r} not found in current task object_scope"
+                    )
+                    if meta_task:
+                        self._tro_load_failure_detail += f" (tro task={meta_task!r})"
+                    logger.error("[eval_skill_sgnav_http][tro] %s", self._tro_load_failure_detail)
+                    return False
                 self.env.task.object_scope[tro_key].load_state(tro_data, serialized=False)
 
         for _ in range(25):
@@ -2033,6 +2117,7 @@ class SGNavHTTPRunner:
             return {
                 "success": False,
                 "error": "tro_not_found",
+                "detail": self._tro_load_failure_detail,
                 "instance_id": int(instance_id),
                 "tro_source_path": self._current_tro_source_path,
                 "steps": 0,
@@ -2667,8 +2752,11 @@ def main():
         "--save_tro_state_to",
         type=str,
         default=None,
-        help="Export the current effective tro_state after reset. If this is a directory, the script writes "
-        "<task>_instance_<id>_tro_state.json inside it. The saved file can be reused later with --tro_state_path.",
+        help="Export the current effective tro_state after reset. If this is an existing directory, writes "
+        "<task>_instance_<id>_tro_state.json inside it. If the path does not exist and does not end with "
+        ".json, it is created as a directory and the default-named file is written there (so "
+        "--tro_state_path <that_dir>/<task>_instance_<id>_tro_state.json works). If it ends with .json, "
+        "that file path is used. The saved file can be reused with --tro_state_path.",
     )
     parser.add_argument(
         "--fail_on_asset_hash_mismatch",

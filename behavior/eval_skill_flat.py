@@ -1024,12 +1024,27 @@ class SkillEvaluator:
         self._cached_tro_state = None
         self.target = None
 
+    def _robot_pose_registry_key(self) -> str:
+        """Key used inside tro_state['robot_poses']; matches OmniGibson BaseRobot.model_name when present."""
+        robot = self.robot
+        if robot is None:
+            return "R1Pro"
+        name = getattr(robot, "model_name", None)
+        if name is not None:
+            return str(name)
+        name = getattr(robot, "_model_name", None)
+        if name is not None:
+            return str(name)
+        cls_name = robot.__class__.__name__
+        return "R1Pro" if cls_name == "Robot" else cls_name
+
     def _reapply_tro_after_reset(self, tro_state: dict) -> None:
         """Match generate_move_to_rft_data.reapply_tro_from_cache (after env.reset())."""
+        rk = self._robot_pose_registry_key()
         for tro_key, tro_data in tro_state.items():
             if tro_key == "robot_poses":
-                if self.robot.model_name in tro_data:
-                    rp = tro_data[self.robot.model_name][0]
+                if rk in tro_data:
+                    rp = tro_data[rk][0]
                     self.robot.set_position_orientation(rp["position"], rp["orientation"])
             elif tro_key in self.env.task.object_scope:
                 self.env.task.object_scope[tro_key].load_state(tro_data, serialized=False)
@@ -1102,13 +1117,14 @@ class SkillEvaluator:
             tro_state = recursively_convert_to_torch(json.load(f))
         self._cached_tro_state = tro_state
 
+        rk = self._robot_pose_registry_key()
         for tro_key, tro_data in tro_state.items():
             if tro_key == "robot_poses":
-                if self.robot.model_name not in tro_data:
+                if rk not in tro_data:
                     self._cached_tro_state = None
                     return False
-                robot_pos = tro_data[self.robot.model_name][0]["position"]
-                robot_quat = tro_data[self.robot.model_name][0]["orientation"]
+                robot_pos = tro_data[rk][0]["position"]
+                robot_quat = tro_data[rk][0]["orientation"]
                 self.robot.set_position_orientation(robot_pos, robot_quat)
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_data)
             else:

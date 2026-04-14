@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import copy
-import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import sys
-from matplotlib import colors
+
 import cv2
 import numpy as np
-import pandas
 import skimage
 import torch
 
@@ -30,28 +25,36 @@ _configure_live_stdio()
 from GLIP.maskrcnn_benchmark.config import cfg as glip_cfg
 from GLIP.maskrcnn_benchmark.engine.predictor_glip import GLIPDemo
 
-from pslpython.model import Model as PSLModel
-from pslpython.partition import Partition
-from pslpython.predicate import Predicate
-from pslpython.rule import Rule
-
 from scenegraph import SceneGraph
 
 import utils.utils_fmm.control_helper as CH
 import utils.utils_fmm.pose_utils as pu
-from utils.utils_fmm.fmm_planner import FMMPlanner    
+from utils.utils_fmm.fmm_planner import FMMPlanner
 from utils.utils_fmm.mapping import Semantic_Mapping
 from utils.utils_glip import *
-from utils.image_process import (
-    add_resized_image,
-    add_resized_image_contain,
-    add_rectangle,
-    add_text,
-    add_text_list,
-    compute_crop_rect,
-    draw_agent,
-    draw_goal,
-    line_list,
+from utils.nav_logger import NavLogger, action_name
+from utils.geometry import (
+    quat_xyzw_to_rpy, quat_xyzw_rotate_vec,
+    wrap_angle_rad, wrap_angle_deg,
+    horiz_angle_from_pixel_u, depth_m_at_xy,
+    goal_gps_to_map_rc, map_rc_to_goal_gps, world_xy_to_grid_rc,
+    get_goal_gps as _get_goal_gps_impl,
+    get_relative_goal_gps as _get_relative_goal_gps_impl,
+    get_goal_stop_status as _get_goal_stop_status_impl,
+    apply_flipud, transform_rc_flipud, inverse_transform_rc_flipud,
+    disk_mask, robot_map_rc,
+)
+from utils.camera_pose import (
+    client_camera_pose_active, sync_camera_extrinsics,
+    check_fall_suspected, maybe_suspend_mapping, consume_mapping_suspend,
+    compute_health_flags,
+)
+from utils.nav_visualization import (
+    build_occupancy_panel, paint_agent_and_goal,
+    render_detection_overlay, build_scenegraph_text,
+    compose_visualization_frame,
+    save_video as _save_video_impl,
+    save_scenegraph_json as _save_scenegraph_json_impl,
 )
 
 
@@ -94,19 +97,11 @@ class SG_Nav_Agent():
 
         self.runtime_cfg = runtime_cfg
         self.distance_threshold = float(_runtime_get("goal_distance_threshold", 5.0))
-        # Print goal_gps_map vote totals when GLIP sees the target (e.g. radio); disable with log_goal_votes: false in yaml.
-        self._log_goal_votes = bool(_runtime_get("log_goal_votes", True))
-        # One line per step: goal_map source, flags, planner action — set nav_debug_trace: true in yaml to locate stalls.
-        self._nav_debug_trace = bool(_runtime_get("nav_debug_trace", False))
-        # GPS/compass vs STG heading: stderr [SG-Nav][pose_align] (see yaml comment).
-        self._log_pose_align_trace = bool(_runtime_get("log_pose_align_trace", False))
         # HTTP / OmniGibson: fix map “forward” vs robot forward (Semantic_Mapping uses heading−90°).
         self._compass_offset_rad = float(
             np.deg2rad(float(_runtime_get("compass_offset_deg", 0.0)))
         )
         self._gps_negate_y = bool(_runtime_get("gps_negate_y", False))
-        # Lightweight: print goal grid cell + Manhattan drift vs previous step (detect frontier / GPS goal hopping).
-        self._log_goal_cell_drift = bool(_runtime_get("log_goal_cell_drift", False))
         # Visualization-only: when the occupancy panel is almost all unknown, legacy code could
         # paint planner traversible as free-space. That also brings along visited path / robot-local
         # bootstrap cells and can look like a duplicated "ghost" map in another corner.
@@ -118,8 +113,6 @@ class SG_Nav_Agent():
         self._visualize_centered_crop_ratio = float(
             _runtime_get("visualize_centered_crop_ratio", 0.50)
         )
-        # One line per step: why the agent is turning / not driving forward (see [SG-Nav][spin]).
-        self._log_spin_diagnosis = bool(_runtime_get("log_spin_diagnosis", True))
         # One line per step: high-level navigation stage in both code and Chinese.
         self._log_nav_stage = bool(_runtime_get("log_nav_stage", True))
         # HTTP / OmniGibson: if ``target_world_xy`` is on the explored occupancy map, plan straight there (FMM).
@@ -231,14 +224,6 @@ class SG_Nav_Agent():
         self.current_frame_step_dir = os.path.join(self.visualization_dir, "video", "frames")
         self.scenegraph_json_path = os.path.join(self.visualization_dir, "video", "current_scenegraph.json")
         self.scenegraph_json_step_dir = os.path.join(self.visualization_dir, "video", "scenegraph")
-        self.debug_json_dir = os.path.join(self.visualization_dir, "debug_json")
-        self.camera_map_sync_jsonl_path = os.path.join(
-            self.debug_json_dir, "camera_map_sync.jsonl"
-        )
-        self.map_fusion_motion_jsonl_path = os.path.join(
-            self.debug_json_dir, "map_fusion_motion.jsonl"
-        )
-        self._dump_motion_debug_json = bool(_runtime_get("dump_motion_debug_json", True))
 
         self.glip_object_caption = object_captions
         self._glip_goal_sg_match_tokens: list[str] = []
@@ -446,13 +431,6 @@ class SG_Nav_Agent():
         self._start_plan_flipud_pose_known_min = float(
             _runtime_get("start_plan_flipud_pose_known_min", 0.35)
         )
-        self._log_map_frame_select = bool(_runtime_get("log_map_frame_select", True))
-        self._log_free_map_distribution = bool(
-            _runtime_get("log_free_map_distribution", True)
-        )
-        self._log_obstacle_map_distribution = bool(
-            _runtime_get("log_obstacle_map_distribution", True)
-        )
         # Edge diagnostics: warn when start is near border and local occupancy is much denser than global.
         self._map_edge_warn_margin_cells = max(
             0, int(_runtime_get("map_edge_warn_margin_cells", 30))
@@ -563,7 +541,6 @@ class SG_Nav_Agent():
         # free map keeps near-floor support region.
         self._map_free_min_z_cm = float(_runtime_get("map_free_min_z_cm", -150.0))
         self._map_free_max_z_cm = float(_runtime_get("map_free_max_z_cm", 25.0))
-        self._log_mapping_height_band = bool(_runtime_get("log_mapping_height_band", True))
         # Clamp client camera extrinsics to keep mapping stable when link pose spikes (e.g. torso singular states).
         self._camera_pitch_min_deg = float(_runtime_get("camera_pitch_min_deg", -45.0))
         self._camera_pitch_max_deg = float(_runtime_get("camera_pitch_max_deg", 45.0))
@@ -596,36 +573,6 @@ class SG_Nav_Agent():
         )
         self._last_good_camera_height_cm = None
         self._last_good_camera_pitch_deg = None
-        self._log_camera_extrinsic_clamp = bool(_runtime_get("log_camera_extrinsic_clamp", True))
-        # stderr: one line per step when camera_pose_world is applied (see _sync_camera_extrinsics).
-        self._log_camera_pose_world = bool(_runtime_get("log_camera_pose_world", False))
-        # Print coordinate-frame assumptions once per reset; keep true while validating planner/panel alignment.
-        self._log_coordinate_assumptions = bool(_runtime_get("log_coordinate_assumptions", True))
-        # Per-step depth/map/traversible stats for diagnosing "all light gray" panel cases.
-        self._log_mapping_stats = bool(_runtime_get("log_mapping_stats", True))
-        # Map write diagnostics:
-        # - full_map_delta: how many obstacle cells are newly added/removed each step.
-        # - collision_paint: cells painted by forward-collision heuristic in _plan.
-        self._log_full_map_delta = bool(_runtime_get("log_full_map_delta", True))
-        self._log_collision_paint = bool(_runtime_get("log_collision_paint", True))
-        # Structured health checks for depth/map/camera; parse [SG-Nav][check] lines while running.
-        self._log_runtime_checks = bool(_runtime_get("log_runtime_checks", True))
-        self._check_traversible_free_warn = float(_runtime_get("check_traversible_free_warn", 0.95))
-        self._check_depth_zero_warn = float(_runtime_get("check_depth_zero_warn", 0.25))
-        self._check_depth_median_min_m = float(_runtime_get("check_depth_median_min_m", 0.08))
-        self._check_depth_median_max_m = float(_runtime_get("check_depth_median_max_m", 8.0))
-        self._check_camera_pitch_abs_warn_deg = float(
-            _runtime_get("check_camera_pitch_abs_warn_deg", 35.0)
-        )
-        self._check_camera_roll_abs_warn_deg = float(
-            _runtime_get("check_camera_roll_abs_warn_deg", 45.0)
-        )
-        self._check_camera_height_min_warn_cm = float(
-            _runtime_get("check_camera_height_min_warn_cm", 70.0)
-        )
-        self._check_camera_height_max_warn_cm = float(
-            _runtime_get("check_camera_height_max_warn_cm", 210.0)
-        )
         # Suspend depth->map fusion for a few steps when collision / fall likely invalidates camera extrinsics.
         self._map_suspend_on_fall = bool(_runtime_get("map_suspend_on_fall", True))
         self._map_suspend_steps_on_fall = max(
@@ -660,27 +607,12 @@ class SG_Nav_Agent():
         self.free_map_module.exp_pred_threshold = float(self._free_exp_pred_threshold)
         self.sem_map_module._diag_warp_mode = str(self._diag_map_warp_mode)
         self.sem_map_module._diag_collect_fusion_stats = bool(
-            self._log_full_map_delta or self._diag_full_map_any_toggle
+            True or self._diag_full_map_any_toggle
         )
         self.free_map_module._diag_warp_mode = "nearest"
         self.free_map_module._diag_collect_fusion_stats = False
         self.room_map_module._diag_warp_mode = "nearest"
         self.room_map_module._diag_collect_fusion_stats = False
-        if self._log_mapping_stats:
-            print(
-                "[SG-Nav][map_module_thresholds] "
-                f"sem_map_pred_cfg={float(self._sem_map_pred_threshold):.2f} "
-                f"sem_exp_pred_cfg={float(self._sem_exp_pred_threshold):.2f} "
-                f"sem_map_pred_used={self.sem_map_module.map_pred_threshold:.2f} "
-                f"sem_exp_pred_used={self.sem_map_module.exp_pred_threshold:.2f} "
-                f"free_map_pred={self.free_map_module.map_pred_threshold:.2f} "
-                f"free_exp_pred={self.free_map_module.exp_pred_threshold:.2f} "
-                f"diag_sem_profile={self._diag_sem_threshold_profile} "
-                f"diag_warp_mode={self._diag_map_warp_mode} "
-                f"diag_freeze_camera={int(self._diag_freeze_camera_extrinsics)} "
-                f"diag_disable_pose_bridge={int(self._diag_disable_pose_bridge)}",
-                flush=True,
-            )
         self._last_camera_diag = None
         print('scene graph module init finish!!!')
 
@@ -746,160 +678,6 @@ class SG_Nav_Agent():
             "iter_ms": [round(float(x), 3) for x in timings_ms],
         }
 
-    def _sync_mapping_height_band(self):
-        """Update Semantic_Mapping z bands to match current projection height and runtime policy."""
-        h_cm = float(self.sem_map_module._camera_height_cm_for_projection())
-        obs_min = float(self._map_obstacle_min_z_cm)
-        if float(self._map_obstacle_max_z_cm) > 0.0:
-            obs_max = float(self._map_obstacle_max_z_cm)
-        else:
-            obs_max = h_cm + float(self._map_obstacle_above_camera_cm)
-        obs_max = max(obs_max, obs_min + 5.0)
-
-        self.sem_map_module.min_z_consider = obs_min
-        self.sem_map_module.max_z_consider = obs_max
-        self.free_map_module.min_z_consider = float(self._map_free_min_z_cm)
-        self.free_map_module.max_z_consider = float(self._map_free_max_z_cm)
-
-        if self._log_mapping_height_band:
-            print(
-                "[SG-Nav][height_band] "
-                f"step={self.total_steps} h_cm={h_cm:.2f} "
-                f"sem_z=[{obs_min:.1f},{obs_max:.1f}] "
-                f"free_z=[{float(self._map_free_min_z_cm):.1f},{float(self._map_free_max_z_cm):.1f}]",
-                flush=True,
-            )
-
-    def _emit_coordinate_assumptions_once(self):
-        if not getattr(self, "_log_coordinate_assumptions", False):
-            return
-        print(
-            "[SG-Nav][coord_assumption] "
-            f"A1: planner_grid_frame_fixed={self._map_frame_fixed_mode}; "
-            "A2: start_row_col is derived from full_pose(x,y) map-meter coords before frame transform; "
-            "A3: goal_map/collision_map/visited share same row-col frame as full_map[0,0]; "
-            "A4: occupancy panel renders unknown/free/obstacle from full_map + fbe_free_map + collision_map. "
-            "If A1-A4 mismatch runtime observations, revisit get_traversible/fbe/set_random_goal.",
-            flush=True,
-        )
-
-    def _log_mapping_snapshot(self, observations, traversible=None):
-        if not getattr(self, "_log_mapping_stats", False):
-            return
-        d = np.asarray(observations.get("depth"))
-        if d.ndim == 3:
-            d = d[..., 0]
-        d1 = d.reshape(-1) if d.size else np.asarray([], dtype=np.float32)
-        dfin = d1[np.isfinite(d1)] if d1.size else d1
-        dpos = dfin[dfin > 0] if dfin.size else dfin
-        dmin = float(np.min(dfin)) if dfin.size else float("nan")
-        dmax = float(np.max(dfin)) if dfin.size else float("nan")
-        dmed = float(np.median(dpos)) if dpos.size else float("nan")
-        dnear_min = float(np.mean(dfin <= 1e-6)) if dfin.size else float("nan")
-
-        fm = self.full_map[0, 0].detach().cpu().numpy()
-        full_occ = float(np.mean(fm > 0.5))
-        full_nonzero = float(np.mean(np.abs(fm) > 1e-6))
-        coll = np.asarray(self.collision_map)
-        coll_occ = float(np.mean(coll > 0.5)) if coll.size else float("nan")
-        fb = self.fbe_free_map[0, 0].detach().cpu().numpy()
-        free_map_occ = float(np.mean(fb > float(self._traversible_free_map_min)))
-        free_map_nonzero = float(np.mean(np.abs(fb) > 1e-6))
-
-        tr_free = float("nan")
-        tr_obs = float("nan")
-        if traversible is not None:
-            tr = np.asarray(traversible)
-            if tr.ndim == 2 and tr.shape[0] >= 3 and tr.shape[1] >= 3:
-                tr = tr[1:-1, 1:-1]
-            if tr.size:
-                tr_free = float(np.mean(tr > 0.5))
-                tr_obs = float(np.mean(tr <= 0.5))
-
-        print(
-            "[SG-Nav][map_stats] "
-            f"step={self.total_steps} "
-            f"depth[min,max,med_pos]=[{dmin:.3f},{dmax:.3f},{dmed:.3f}] "
-            f"depth_zero_frac={dnear_min:.3f} "
-            f"full_map_occ={full_occ:.3f} full_map_nonzero={full_nonzero:.3f} "
-            f"collision_occ={coll_occ:.3f} "
-            f"free_map_occ={free_map_occ:.3f} free_map_nonzero={free_map_nonzero:.3f} "
-            f"traversible_free={tr_free:.3f} traversible_obs={tr_obs:.3f}",
-            flush=True,
-        )
-        self._log_runtime_check_flags(
-            dmin=dmin,
-            dmax=dmax,
-            dmed=dmed,
-            dnear_min=dnear_min,
-            full_occ=full_occ,
-            coll_occ=coll_occ,
-            tr_free=tr_free,
-            tr_obs=tr_obs,
-        )
-
-    def _log_runtime_check_flags(
-        self, *, dmin, dmax, dmed, dnear_min, full_occ, coll_occ, tr_free, tr_obs
-    ):
-        if not getattr(self, "_log_runtime_checks", False):
-            return
-        flags = []
-        cam = self._last_camera_diag if isinstance(self._last_camera_diag, dict) else None
-
-        if math.isfinite(tr_free) and tr_free >= self._check_traversible_free_warn:
-            flags.append("TRAVERSIBLE_TOO_FREE")
-        if math.isfinite(dnear_min) and dnear_min >= self._check_depth_zero_warn:
-            flags.append("DEPTH_TOO_MANY_ZEROS")
-        if math.isfinite(dmed) and (
-            dmed < self._check_depth_median_min_m
-            or dmed > self._check_depth_median_max_m
-        ):
-            flags.append("DEPTH_MEDIAN_OUT_OF_RANGE")
-        if cam and cam.get("active", False):
-            roll_abs = abs(float(cam.get("roll_deg", 0.0)))
-            pitch_abs = abs(float(cam.get("pitch_deg_used", 0.0)))
-            h_used = cam.get("height_cm_used", None)
-            tilt_src_for_map = str(cam.get("tilt_source", "") or "")
-            tilt_fallback = cam.get("tilt_fallback", None)
-            # Large roll is often expected for fixed camera-frame offsets (e.g. sensor mounted with ~90deg roll).
-            # Only warn when mapping actually relies on raw roll (without fallback).
-            if (
-                tilt_src_for_map == "roll"
-                and tilt_fallback is None
-                and roll_abs >= self._check_camera_roll_abs_warn_deg
-            ):
-                flags.append("CAMERA_ROLL_LARGE")
-            if pitch_abs >= self._check_camera_pitch_abs_warn_deg:
-                flags.append("CAMERA_PITCH_LARGE")
-            if h_used is not None and (
-                float(h_used) < self._check_camera_height_min_warn_cm
-                or float(h_used) > self._check_camera_height_max_warn_cm
-            ):
-                flags.append("CAMERA_HEIGHT_OUTLIER")
-            # Strong fall suspicion: severe tilt + very low camera height.
-            if h_used is not None and float(h_used) < 90.0 and (
-                roll_abs > 60.0 or pitch_abs > 45.0
-            ):
-                flags.append("FALL_SUSPECTED")
-
-        flags_txt = "OK" if not flags else "|".join(flags)
-        cam_txt = "inactive"
-        if cam and cam.get("active", False):
-            cam_txt = (
-                f"src={cam.get('pose_source', 'unknown')} "
-                f"roll={float(cam.get('roll_deg', float('nan'))):.1f} "
-                f"pitch_used={float(cam.get('pitch_deg_used', float('nan'))):.1f} "
-                f"h_used_cm={cam.get('height_cm_used', None)!r}"
-            )
-
-        print(
-            "[SG-Nav][check] "
-            f"step={self.total_steps} flags={flags_txt} "
-            f"depth[min,max,med]=[{dmin:.3f},{dmax:.3f},{dmed:.3f}] "
-            f"zero_frac={dnear_min:.3f} map_occ={full_occ:.3f} coll_occ={coll_occ:.3f} "
-            f"tr_free={tr_free:.3f} tr_obs={tr_obs:.3f} cam={cam_txt}",
-            flush=True,
-        )
 
     def _set_full_pose_from_arrays(self, gps_arr, compass_arr):
         gps_t = torch.from_numpy(np.asarray(gps_arr, dtype=np.float64)).to(self.device)
@@ -909,68 +687,20 @@ class SG_Nav_Agent():
         self.full_pose[2:] = comp_t * 57.29577951308232
         self._clamp_full_pose_xy_to_map_meters()
 
-    def _current_camera_fall_suspected(self):
-        cam = self._last_camera_diag if isinstance(self._last_camera_diag, dict) else None
-        if not cam or not cam.get("active", False):
-            return False, "camera_inactive"
-        roll_abs = abs(float(cam.get("roll_deg", 0.0)))
-        pitch_abs = abs(float(cam.get("pitch_deg_used", 0.0)))
-        h_used = cam.get("height_cm_used", None)
-        reasons = []
-        if roll_abs >= float(self._map_suspend_roll_deg):
-            reasons.append(f"roll={roll_abs:.1f}")
-        if pitch_abs >= float(self._map_suspend_pitch_deg):
-            reasons.append(f"pitch={pitch_abs:.1f}")
-        if h_used is not None and float(h_used) <= float(self._map_suspend_height_cm):
-            reasons.append(f"height={float(h_used):.1f}cm")
-        h_last = getattr(self, "_last_good_camera_height_cm", None)
-        if (
-            h_used is not None
-            and h_last is not None
-            and math.isfinite(float(h_used))
-            and math.isfinite(float(h_last))
-            and abs(float(h_used) - float(h_last)) >= float(self._map_suspend_height_delta_cm)
-        ):
-            reasons.append(f"height_delta={abs(float(h_used) - float(h_last)):.1f}cm")
-        return (len(reasons) > 0), ",".join(reasons) if reasons else "ok"
-
     def _maybe_suspend_mapping_due_to_fall(self):
         if not bool(getattr(self, "_map_suspend_on_fall", False)):
             return
-        client_collision = getattr(self, "_client_collision_prev", None) or {}
-        had_contact = bool(client_collision.get("base_contact", False))
-        suspected, reason = self._current_camera_fall_suspected()
-        if suspected:
-            trigger = "collision_fall" if had_contact else "pose_fall"
-            self._mapping_suspend_countdown = max(
-                int(getattr(self, "_mapping_suspend_countdown", 0)),
-                int(self._map_suspend_steps_on_fall),
-            )
-            print(
-                "[SG-Nav][map_suspend] "
-                f"step={self.total_steps} trigger={trigger} "
-                f"countdown={int(self._mapping_suspend_countdown)} "
-                f"reason={reason}",
-                flush=True,
-            )
+        self._mapping_suspend_countdown = maybe_suspend_mapping(
+            self._last_camera_diag,
+            self._last_good_camera_height_cm,
+            int(getattr(self, "_mapping_suspend_countdown", 0)),
+            getattr(self, "_client_collision_prev", None),
+        )
 
     def _consume_mapping_suspend(self, stage: str) -> bool:
-        countdown = int(getattr(self, "_mapping_suspend_countdown", 0))
-        if countdown <= 0:
-            return False
-        already_consumed = (
-            int(getattr(self, "_mapping_suspend_last_step", -1)) == int(self.total_steps)
-        )
-        print(
-            "[SG-Nav][map_suspend] "
-            f"step={self.total_steps} stage={stage} "
-            f"remaining={countdown}",
-            flush=True,
-        )
-        if not already_consumed:
-            self._mapping_suspend_countdown = max(0, countdown - 1)
-            self._mapping_suspend_last_step = int(self.total_steps)
-        return True
+        skip, new_cd = consume_mapping_suspend(int(getattr(self, "_mapping_suspend_countdown", 0)))
+        self._mapping_suspend_countdown = new_cd
+        return skip
 
     def _sync_glip_object_caption(self):
         """
@@ -1017,20 +747,8 @@ class SG_Nav_Agent():
             else:
                 self.scenegraph.node_space = ns0
 
-    def _horiz_angle_from_pixel_u(self, u_pixel):
-        """Horizontal viewing angle in degrees, linear pinhole model (matches legacy 640/79)."""
-        cx = (self.sensor_width - 1) / 2.0
-        return (float(u_pixel) - cx) * self.hfov_deg / float(self.sensor_width)
-
     def _pix_i(self, v):
         return int(v.item()) if hasattr(v, "item") else int(v)
-
-    def _depth_m_at_xy(self, x_col, y_row):
-        """Depth (meters) at pixel (column x, row y); clips to the depth buffer."""
-        h, w = int(self.depth.shape[0]), int(self.depth.shape[1])
-        xc = int(np.clip(self._pix_i(x_col), 0, w - 1))
-        yr = int(np.clip(self._pix_i(y_row), 0, h - 1))
-        return self.depth[yr, xc, 0]
 
     def _refresh_co_occurrence_priors(self):
         """Fill prob_array_* for PSL; uniform prior if goal is outside MP3D training categories."""
@@ -1044,34 +762,6 @@ class SG_Nav_Agent():
             self.prob_array_room = np.ones(n_o, dtype=np.float64) / n_o
             self.prob_array_obj = np.ones(n_p, dtype=np.float64) / n_p
 
-    @staticmethod
-    def _quat_xyzw_to_rpy(qx, qy, qz, qw):
-        """Roll/pitch/yaw (rad); quaternion order x,y,z,w (OmniGibson-style)."""
-        n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-        if not math.isfinite(n) or n < 1e-9:
-            return 0.0, 0.0, 0.0
-        qx, qy, qz, qw = (qx / n, qy / n, qz / n, qw / n)
-        sinr_cosp = 2.0 * (qw * qx + qy * qz)
-        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        sinp = 2.0 * (qw * qy - qz * qx)
-        if abs(sinp) >= 1.0:
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-        siny_cosp = 2.0 * (qw * qz + qx * qy)
-        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        return roll, pitch, yaw
-
-    @staticmethod
-    def _wrap_angle_rad_pm_pi(angle_rad: float) -> float:
-        x = float(angle_rad)
-        while x > math.pi:
-            x -= 2.0 * math.pi
-        while x < -math.pi:
-            x += 2.0 * math.pi
-        return x
 
     def _update_observed_turn_from_compass(self, observations) -> None:
         comp = np.asarray(observations.get("compass", [0.0]), dtype=np.float64).reshape(-1)
@@ -1085,7 +775,7 @@ class SG_Nav_Agent():
         if int(getattr(self, "prev_action", 0)) not in (2, 3, 6):
             return
 
-        delta_rad = self._wrap_angle_rad_pm_pi(cur_compass_rad - float(prev_compass_rad))
+        delta_rad = wrap_angle_rad(cur_compass_rad - float(prev_compass_rad))
         delta_deg = abs(math.degrees(delta_rad))
         self._planner_last_turn_delta_deg = float(delta_deg)
         if not math.isfinite(delta_deg):
@@ -1098,517 +788,27 @@ class SG_Nav_Agent():
             (1.0 - alpha) * float(self._planner_observed_turn_deg) + alpha * float(delta_deg)
         )
 
-    @staticmethod
-    def _quat_xyzw_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
-        """Rotate vector by quaternion (xyzw)."""
-        n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-        if not math.isfinite(n) or n < 1e-9:
-            return float(vx), float(vy), float(vz)
-        x, y, z, w = (qx / n, qy / n, qz / n, qw / n)
-        # R(q) for xyzw
-        r00 = 1.0 - 2.0 * (y * y + z * z)
-        r01 = 2.0 * (x * y - z * w)
-        r02 = 2.0 * (x * z + y * w)
-        r10 = 2.0 * (x * y + z * w)
-        r11 = 1.0 - 2.0 * (x * x + z * z)
-        r12 = 2.0 * (y * z - x * w)
-        r20 = 2.0 * (x * z - y * w)
-        r21 = 2.0 * (y * z + x * w)
-        r22 = 1.0 - 2.0 * (x * x + y * y)
-        wx = r00 * vx + r01 * vy + r02 * vz
-        wy = r10 * vx + r11 * vy + r12 * vz
-        wz = r20 * vx + r21 * vy + r22 * vz
-        return float(wx), float(wy), float(wz)
 
-    def _append_debug_jsonl(self, path: str, payload: dict) -> None:
-        if not bool(getattr(self, "_dump_motion_debug_json", False)):
-            return
-        def _json_safe(value):
-            if isinstance(value, dict):
-                return {str(k): _json_safe(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [_json_safe(v) for v in value]
-            if isinstance(value, float):
-                return None if not math.isfinite(value) else float(value)
-            if isinstance(value, np.floating):
-                fv = float(value)
-                return None if not math.isfinite(fv) else fv
-            if isinstance(value, np.integer):
-                return int(value)
-            return value
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
-
-    def _dump_camera_map_sync_debug(self, observations) -> None:
-        if not bool(getattr(self, "_dump_motion_debug_json", False)):
-            return
-        camera_diag = getattr(self, "_last_camera_diag", None)
-        if not isinstance(camera_diag, dict):
-            return
-        cpp = observations.get("camera_pose_world")
-        payload = {
-            "event": "camera_map_sync",
-            "episode": int(getattr(self, "count_episodes", 0)),
-            "step": int(getattr(self, "total_steps", 0)),
-            "navigate_step": int(getattr(self, "navigate_steps", 0)),
-            "camera_diag": {
-                "active": bool(camera_diag.get("active", False)),
-                "mode": str(camera_diag.get("mode", "unknown")),
-                "pose_source": str(camera_diag.get("pose_source", "unknown")),
-                "tilt_source": str(camera_diag.get("tilt_source", "unknown")),
-                "tilt_source_raw_deg": float(camera_diag.get("tilt_source_raw_deg", float("nan"))),
-                "tilt_fallback": camera_diag.get("tilt_fallback"),
-                "roll_deg": float(camera_diag.get("roll_deg", float("nan"))),
-                "pitch_deg_raw": float(camera_diag.get("pitch_deg_raw", float("nan"))),
-                "pitch_deg_used": float(camera_diag.get("pitch_deg_used", float("nan"))),
-                "view_angle_cmd_deg": float(camera_diag.get("view_angle_cmd_deg", float("nan"))),
-                "cam_z_down_pitch_deg": float(camera_diag.get("cam_z_down_pitch_deg", float("nan"))),
-                "cam_y_down_pitch_deg": float(camera_diag.get("cam_y_down_pitch_deg", float("nan"))),
-                "height_cm_raw": (
-                    None if camera_diag.get("height_cm_raw") is None else float(camera_diag.get("height_cm_raw"))
-                ),
-                "height_cm_used": (
-                    None if camera_diag.get("height_cm_used") is None else float(camera_diag.get("height_cm_used"))
-                ),
-                "sem_pitch_deg_used": float(camera_diag.get("sem_pitch_deg_used", float("nan"))),
-                "sem_height_cm_used": float(camera_diag.get("sem_height_cm_used", float("nan"))),
-                "diag_freeze_camera_extrinsics": bool(
-                    camera_diag.get("diag_freeze_camera_extrinsics", False)
-                ),
-                "pos_m": [
-                    float(x) for x in list(camera_diag.get("pos_m", []))[:3]
-                ],
-                "quat_xyzw": [
-                    float(x) for x in list(camera_diag.get("quat_xyzw", []))[:4]
-                ],
-            },
-            "client_camera_pose_world": cpp if isinstance(cpp, dict) else None,
-            "full_pose_m_deg": [
-                float(self.full_pose[0].detach().cpu().item()),
-                float(self.full_pose[1].detach().cpu().item()),
-                float(self.full_pose[2].detach().cpu().item()),
-            ],
-            "mapping_suspend_countdown": int(getattr(self, "_mapping_suspend_countdown", 0)),
-        }
-        self._append_debug_jsonl(self.camera_map_sync_jsonl_path, payload)
-
-    def _dump_map_fusion_motion_debug(
-        self,
-        *,
-        map_pose_source: str,
-        pose_rc: tuple[int, int],
-        pose_delta_r: int,
-        pose_delta_c: int,
-        pose_delta_l2: float,
-        fusion_diag: dict | None,
-        occ_thr: float,
-        prev_occ_ratio: float,
-        now_occ_ratio: float,
-        add_ratio: float,
-        del_ratio: float,
-        occ_local: float,
-        add_local: float,
-        add_local_count: int,
-        prev_local_count: int,
-        now_local_count: int,
-        add_near: float,
-        add_ring: float,
-        cam_mode: str,
-        cam_pitch_deg: float,
-        cam_height_cm: float,
-        start_ij: tuple[int, int],
-    ) -> None:
-        if not bool(getattr(self, "_dump_motion_debug_json", False)):
-            return
-        payload = {
-            "event": "map_fusion_motion",
-            "episode": int(getattr(self, "count_episodes", 0)),
-            "step": int(getattr(self, "total_steps", 0)),
-            "navigate_step": int(getattr(self, "navigate_steps", 0)),
-            "map_pose_source": str(map_pose_source),
-            "pose_rc": [int(pose_rc[0]), int(pose_rc[1])],
-            "pose_delta_rc": [int(pose_delta_r), int(pose_delta_c)],
-            "pose_delta_l2": float(pose_delta_l2),
-            "full_pose_m_deg": [
-                float(self.full_pose[0].detach().cpu().item()),
-                float(self.full_pose[1].detach().cpu().item()),
-                float(self.full_pose[2].detach().cpu().item()),
-            ],
-            "start_ij": [int(start_ij[0]), int(start_ij[1])],
-            "fusion_diag": None if fusion_diag is None else {
-                "warp_mode": fusion_diag.get("warp_mode"),
-                "local_patch_occ_count": int(fusion_diag.get("local_patch_occ_count", 0)),
-                "translated_occ_count": int(fusion_diag.get("translated_occ_count", 0)),
-                "maps_last_occ_count": int(fusion_diag.get("maps_last_occ_count", 0)),
-                "overlap_count": int(fusion_diag.get("overlap_count", 0)),
-                "overlap_ratio": float(fusion_diag.get("overlap_ratio", 0.0)),
-                "local_patch_max": float(fusion_diag.get("local_patch_max", 0.0)),
-                "translated_max": float(fusion_diag.get("translated_max", 0.0)),
-            },
-            "occ_thr": float(occ_thr),
-            "prev_occ_ratio": float(prev_occ_ratio),
-            "now_occ_ratio": float(now_occ_ratio),
-            "add_occ_ratio": float(add_ratio),
-            "del_occ_ratio": float(del_ratio),
-            "local_occ_ratio": float(occ_local),
-            "local_add_ratio": float(add_local),
-            "local_add_count": int(add_local_count),
-            "local_prev_count": int(prev_local_count),
-            "local_now_count": int(now_local_count),
-            "add_near_ratio": float(add_near),
-            "add_ring_ratio": float(add_ring),
-            "cam_mode": str(cam_mode),
-            "cam_pitch_deg": float(cam_pitch_deg),
-            "cam_height_cm": float(cam_height_cm),
-        }
-        self._append_debug_jsonl(self.map_fusion_motion_jsonl_path, payload)
-
-    def _client_camera_pose_active(self, observations):
-        if not self._camera_extrinsic_use_client_pose:
-            return False
-        cpp = observations.get("camera_pose_world")
-        if not isinstance(cpp, dict):
-            return False
-        pos = cpp.get("position")
-        quat = cpp.get("quaternion")
-        if not isinstance(pos, (list, tuple)) or len(pos) < 3:
-            return False
-        if not isinstance(quat, (list, tuple)) or len(quat) < 4:
-            return False
-        return True
-
-    def _diag_frozen_sem_camera_height_cm(self):
-        if self._camera_height_fallback_cm > 0.0:
-            return float(
-                np.clip(
-                    self._camera_height_fallback_cm,
-                    self._camera_height_min_cm,
-                    self._camera_height_max_cm,
-                )
-            )
-        return None
-
-    def _apply_diag_frozen_sem_camera_extrinsics(self):
-        if not bool(getattr(self, "_diag_freeze_camera_extrinsics", False)):
-            return None
-        h_cm = self._diag_frozen_sem_camera_height_cm()
-        view_angle_cmd_deg = float(self.camera_horizon)
-        self.sem_map_module.set_view_angles(view_angle_cmd_deg)
-        self.sem_map_module._extrinsic_height_cm = h_cm
-        self._sync_mapping_height_band()
-        return {
-            "mode": "diag_freeze_camera_extrinsics",
-            "sem_view_angle_cmd_deg": float(view_angle_cmd_deg),
-            "sem_pitch_deg_used": float(-view_angle_cmd_deg),
-            "sem_height_cm_used": float(
-                self.sem_map_module._camera_height_cm_for_projection()
-            ),
-            "diag_freeze_camera_extrinsics": True,
-        }
 
     def _sync_camera_extrinsics(self, observations):
-        """Align Semantic_Mapping pitch/height with client-reported camera link before update_map."""
+        """Delegate to utils/camera_pose.sync_camera_extrinsics."""
         modules = (self.sem_map_module, self.free_map_module, self.room_map_module)
-        if not self._client_camera_pose_active(observations):
-            h_fb = None
-            if self._camera_height_fallback_cm > 0.0:
-                h_fb = float(
-                    np.clip(
-                        self._camera_height_fallback_cm,
-                        self._camera_height_min_cm,
-                        self._camera_height_max_cm,
-                    )
-                )
-            for m in modules:
-                m._extrinsic_height_cm = h_fb
-            self._sync_mapping_height_band()
-            diag_freeze = self._apply_diag_frozen_sem_camera_extrinsics()
-            self._last_camera_diag = {
-                "active": False,
-                "mode": "fallback_fixed_height" if h_fb is not None else "fallback_cfg_agent_height",
-                "sem_view_angle_cmd_deg": float(
-                    diag_freeze["sem_view_angle_cmd_deg"] if diag_freeze is not None else self.camera_horizon
-                ),
-                "sem_pitch_deg_used": float(
-                    diag_freeze["sem_pitch_deg_used"] if diag_freeze is not None else -self.camera_horizon
-                ),
-                "sem_height_cm_used": float(
-                    diag_freeze["sem_height_cm_used"]
-                    if diag_freeze is not None
-                    else self.sem_map_module._camera_height_cm_for_projection()
-                ),
-                "diag_freeze_camera_extrinsics": bool(diag_freeze is not None),
-            }
-            if self._log_camera_pose_world and h_fb is not None:
-                print(
-                    "[SG-Nav][camera_pose] "
-                    f"step={self.total_steps} mode=fallback_fixed_height "
-                    f"extrinsic_height_cm={h_fb:.3f} "
-                    f"sem_view_angle_cmd_deg={self._last_camera_diag['sem_view_angle_cmd_deg']:.3f} "
-                    f"sem_pitch_deg_used={self._last_camera_diag['sem_pitch_deg_used']:.3f} "
-                    f"diag_freeze={int(self._last_camera_diag['diag_freeze_camera_extrinsics'])}",
-                    flush=True,
-                )
-            self._dump_camera_map_sync_debug(observations)
-            return
-        cpp = observations["camera_pose_world"]
-        px = float(cpp["position"][0])
-        py = float(cpp["position"][1])
-        pz = float(cpp["position"][2])
-        cam_source = str(cpp.get("source", "unknown"))
-        qx, qy, qz, qw = (float(cpp["quaternion"][i]) for i in range(4))
-        roll, pitch, yaw = self._quat_xyzw_to_rpy(qx, qy, qz, qw)
-        # Vector-based tilt diagnostics (independent from Euler branch choice):
-        # depth_utils camera frame uses +Y as forward(depth axis), +Z as image-up.
-        # Note: ``Semantic_Mapping.set_view_angles`` expects a "look-down positive" command and
-        # internally negates it before applying the x-axis rotation. The vector-derived tilt we
-        # log below follows the direct world-vector sign, so we convert signs only at the final
-        # handoff into the mapping module.
-        z_w = self._quat_xyzw_rotate_vec(qx, qy, qz, qw, 0.0, 0.0, 1.0)
-        y_w = self._quat_xyzw_rotate_vec(qx, qy, qz, qw, 0.0, 1.0, 0.0)
-        z_h = math.hypot(z_w[0], z_w[1])
-        y_h = math.hypot(y_w[0], y_w[1])
-        cam_z_down_pitch_deg = -math.degrees(math.atan2(z_w[2], max(z_h, 1e-9)))
-        cam_y_down_pitch_deg = -math.degrees(math.atan2(y_w[2], max(y_h, 1e-9)))
-        tilt_fallback = None
-        tilt_source = self._camera_tilt_source
-        if tilt_source == "roll":
-            tilt_src_deg = math.degrees(roll)
-        elif tilt_source == "yaw":
-            tilt_src_deg = math.degrees(yaw)
-        elif tilt_source == "cam_z_down":
-            tilt_src_deg = float(cam_z_down_pitch_deg)
-        elif tilt_source == "cam_y_down":
-            tilt_src_deg = float(cam_y_down_pitch_deg)
-        else:
-            tilt_source = "pitch"
-            tilt_src_deg = math.degrees(pitch)
-        pitch_deg_raw = (
-            float(tilt_src_deg) * self._camera_pitch_mapping_scale
-            + self._camera_pitch_mapping_offset_deg
+        result = sync_camera_extrinsics(
+            observations, modules,
+            camera_tilt_source=self._camera_tilt_source,
+            camera_height_fallback_cm=self._camera_height_fallback_cm,
+            camera_pitch_min_deg=self._camera_pitch_min_deg,
+            camera_pitch_max_deg=self._camera_pitch_max_deg,
+            camera_height_min_cm=self._camera_height_min_cm,
+            camera_height_max_cm=self._camera_height_max_cm,
+            map_obstacle_min_z_cm=self._map_obstacle_min_z_cm,
+            last_good_height_cm=self._last_good_camera_height_cm,
+            last_good_pitch_deg=self._last_good_camera_pitch_deg,
         )
-        if (
-            tilt_source == "roll"
-            and bool(getattr(self, "_camera_tilt_fallback_to_cam_z_down_on_outlier", True))
-            and math.isfinite(float(cam_z_down_pitch_deg))
-            and abs(float(pitch_deg_raw)) > float(self._camera_pitch_reject_abs_deg)
-        ):
-            # roll(+offset) can jump by ~180 due Euler branch ambiguity; use vector-derived tilt instead.
-            pitch_deg_raw = float(cam_z_down_pitch_deg)
-            tilt_fallback = "roll_outlier_to_cam_z_down"
-        # roll / yaw are periodic in 360deg; unwrap mapped pitch around last good value
-        # to avoid branch-cut jumps (e.g. +179 -> -179) polluting depth projection.
-        if (
-            tilt_source in ("roll", "yaw")
-            and self._last_good_camera_pitch_deg is not None
-            and math.isfinite(float(pitch_deg_raw))
-        ):
-            period = abs(float(self._camera_pitch_mapping_scale)) * 360.0
-            if period > 1e-6:
-                ref = float(self._last_good_camera_pitch_deg)
-                k = round((float(pitch_deg_raw) - ref) / period)
-                pitch_deg_raw = float(pitch_deg_raw) - float(k) * period
-        pitch_deg = float(np.clip(pitch_deg_raw, self._camera_pitch_min_deg, self._camera_pitch_max_deg))
-        h_cm_raw = None
-        h_cm = None
-        reject_reason = None
-        if self._camera_height_from_world_z:
-            z_m = pz + self._camera_height_z_offset_m
-            h_cm_raw = z_m * 100.0
-            h_cm = float(np.clip(h_cm_raw, self._camera_height_min_cm, self._camera_height_max_cm))
+        self._last_camera_diag = result["diag"]
+        self._last_good_camera_height_cm = result["last_good_height_cm"]
+        self._last_good_camera_pitch_deg = result["last_good_pitch_deg"]
 
-        if self._camera_extrinsic_reject_outlier:
-            pitch_bad = (
-                (not np.isfinite(pitch_deg_raw))
-                or abs(float(pitch_deg_raw)) > float(self._camera_pitch_reject_abs_deg)
-            )
-            height_bad = False
-            if self._camera_height_from_world_z:
-                height_bad = (
-                    (not np.isfinite(h_cm_raw))
-                    or float(h_cm_raw) < float(self._camera_height_reject_min_cm)
-                    or float(h_cm_raw) > float(self._camera_height_reject_max_cm)
-                )
-            motion_jump_pitch = False
-            motion_jump_height = False
-            pitch_delta = None
-            height_delta = None
-            client_collision = getattr(self, "_client_collision_prev", None) or {}
-            prev_action = client_collision.get("prev_action", None)
-            prev_action_is_motion = prev_action in (1, 2, 3, 6)
-            if (
-                self._camera_extrinsic_reject_motion_delta
-                and prev_action_is_motion
-                and self._last_good_camera_pitch_deg is not None
-                and np.isfinite(float(pitch_deg))
-            ):
-                pitch_delta = abs(float(pitch_deg) - float(self._last_good_camera_pitch_deg))
-                motion_jump_pitch = pitch_delta >= float(self._camera_pitch_reject_delta_deg)
-            if (
-                self._camera_extrinsic_reject_motion_delta
-                and prev_action_is_motion
-                and self._camera_height_from_world_z
-                and h_cm is not None
-                and self._last_good_camera_height_cm is not None
-                and np.isfinite(float(h_cm))
-            ):
-                height_delta = abs(float(h_cm) - float(self._last_good_camera_height_cm))
-                motion_jump_height = height_delta >= float(self._camera_height_reject_delta_cm)
-            if pitch_bad or height_bad or motion_jump_pitch or motion_jump_height:
-                reasons = []
-                if pitch_bad:
-                    reasons.append("pitch_outlier")
-                if height_bad:
-                    reasons.append("height_outlier")
-                if motion_jump_pitch:
-                    reasons.append(
-                        f"pitch_motion_delta={float(pitch_delta):.1f}"
-                    )
-                if motion_jump_height:
-                    reasons.append(
-                        f"height_motion_delta={float(height_delta):.1f}cm"
-                    )
-                reject_reason = ",".join(reasons)
-                if self._last_good_camera_pitch_deg is not None:
-                    pitch_deg = float(self._last_good_camera_pitch_deg)
-                else:
-                    pitch_deg = float(np.clip(0.0, self._camera_pitch_min_deg, self._camera_pitch_max_deg))
-                if self._camera_height_from_world_z:
-                    if self._last_good_camera_height_cm is not None:
-                        h_cm = float(self._last_good_camera_height_cm)
-                    elif self._camera_height_fallback_cm > 0.0:
-                        h_cm = float(
-                            np.clip(
-                                self._camera_height_fallback_cm,
-                                self._camera_height_min_cm,
-                                self._camera_height_max_cm,
-                            )
-                        )
-                    else:
-                        h_cm = float(
-                            np.clip(
-                                self.config.SIMULATOR.AGENT_0.HEIGHT * 100.0,
-                                self._camera_height_min_cm,
-                                self._camera_height_max_cm,
-                            )
-                        )
-            else:
-                self._last_good_camera_pitch_deg = float(pitch_deg)
-                if self._camera_height_from_world_z and h_cm is not None:
-                    self._last_good_camera_height_cm = float(h_cm)
-
-        _pitch_mismatch = abs(float(pitch_deg) - float(pitch_deg_raw))
-        _height_mismatch = (
-            abs(float(h_cm) - float(h_cm_raw))
-            if (h_cm is not None and h_cm_raw is not None)
-            else 0.0
-        )
-        if _pitch_mismatch > 0.5 or _height_mismatch > 1.0:
-            self._mapping_suspend_countdown = max(
-                int(getattr(self, "_mapping_suspend_countdown", 0)), 1
-            )
-
-        view_angle_cmd_deg = float(-pitch_deg)
-        for m in modules:
-            m.set_view_angles(view_angle_cmd_deg)
-            if self._camera_height_from_world_z:
-                m._extrinsic_height_cm = h_cm
-            else:
-                m._extrinsic_height_cm = None
-        self._sync_mapping_height_band()
-        diag_freeze = self._apply_diag_frozen_sem_camera_extrinsics()
-        self._last_camera_diag = {
-            "active": True,
-            "mode": "client_pose",
-            "roll_deg": float(math.degrees(roll)),
-            "pitch_deg_raw": float(pitch_deg_raw),
-            "pitch_deg_used": float(pitch_deg),
-            "view_angle_cmd_deg": float(view_angle_cmd_deg),
-            "tilt_source": tilt_source,
-            "pose_source": cam_source,
-            "tilt_source_raw_deg": float(tilt_src_deg),
-            "tilt_fallback": tilt_fallback,
-            "cam_z_down_pitch_deg": float(cam_z_down_pitch_deg),
-            "cam_y_down_pitch_deg": float(cam_y_down_pitch_deg),
-            "height_cm_raw": None if h_cm_raw is None else float(h_cm_raw),
-            "height_cm_used": None if h_cm is None else float(h_cm),
-            "quat_xyzw": [float(qx), float(qy), float(qz), float(qw)],
-            "pos_m": [float(px), float(py), float(pz)],
-            "sem_view_angle_cmd_deg": float(
-                diag_freeze["sem_view_angle_cmd_deg"] if diag_freeze is not None else view_angle_cmd_deg
-            ),
-            "sem_pitch_deg_used": float(
-                diag_freeze["sem_pitch_deg_used"] if diag_freeze is not None else pitch_deg
-            ),
-            "sem_height_cm_used": float(
-                diag_freeze["sem_height_cm_used"]
-                if diag_freeze is not None
-                else self.sem_map_module._camera_height_cm_for_projection()
-            ),
-            "diag_freeze_camera_extrinsics": bool(diag_freeze is not None),
-        }
-        if self._log_camera_extrinsic_clamp and (
-            abs(pitch_deg - pitch_deg_raw) > 1e-6
-            or (h_cm_raw is not None and h_cm is not None and abs(h_cm - h_cm_raw) > 1e-6)
-        ):
-            print(
-                "[SG-Nav][camera_extrinsic_clamp] "
-                f"step={self.total_steps} "
-                f"pitch_raw={pitch_deg_raw:.3f} pitch_used={pitch_deg:.3f} "
-                f"height_raw_cm={h_cm_raw!r} height_used_cm={h_cm!r}"
-                + (f" reject={reject_reason}" if reject_reason else ""),
-                flush=True,
-            )
-        if self._log_camera_pose_world:
-            h_cm_log = (
-                self.sem_map_module._extrinsic_height_cm
-                if self._camera_height_from_world_z
-                else None
-            )
-            print(
-                "[SG-Nav][camera_pose] "
-                f"step={self.total_steps} "
-                f"pos_m=[{px:.5f}, {py:.5f}, {pz:.5f}] "
-                f"quat_xyzw=[{qx:.5f}, {qy:.5f}, {qz:.5f}, {qw:.5f}] "
-                f"rpy_deg=[{math.degrees(roll):.3f}, {math.degrees(pitch):.3f}, {math.degrees(yaw):.3f}] "
-                f"pose_source={cam_source} "
-                f"tilt_source={tilt_source} tilt_source_raw_deg={tilt_src_deg:.3f} "
-                f"tilt_fallback={tilt_fallback} "
-                f"cam_z_down_pitch_deg={cam_z_down_pitch_deg:.3f} "
-                f"cam_y_down_pitch_deg={cam_y_down_pitch_deg:.3f} "
-                f"map_pitch_deg_raw={pitch_deg_raw:.3f} map_pitch_deg_used={pitch_deg:.3f} "
-                f"view_angle_cmd_deg={view_angle_cmd_deg:.3f} "
-                f"extrinsic_height_cm={h_cm_log!r} "
-                f"sem_pitch_deg_used={self._last_camera_diag['sem_pitch_deg_used']:.3f} "
-                f"sem_height_cm_used={self._last_camera_diag['sem_height_cm_used']:.3f} "
-                f"diag_freeze={int(self._last_camera_diag['diag_freeze_camera_extrinsics'])}",
-                flush=True,
-            )
-        self._dump_camera_map_sync_debug(observations)
-
-    def add_predicates(self, model):
-        predicate = Predicate('IsNearObj', closed = True, size = 2)
-        model.add_predicate(predicate)
-        predicate = Predicate('ObjCooccur', closed = True, size = 1)
-        model.add_predicate(predicate)
-        predicate = Predicate('IsNearRoom', closed = True, size = 2)
-        model.add_predicate(predicate)
-        predicate = Predicate('RoomCooccur', closed = True, size = 1)
-        model.add_predicate(predicate)
-        predicate = Predicate('Choose', closed = False, size = 1)
-        model.add_predicate(predicate)
-        predicate = Predicate('ShortDist', closed = True, size = 1)
-        model.add_predicate(predicate)
-        
-    def add_rules(self, model):
-        model.add_rule(Rule('2: ObjCooccur(O) & IsNearObj(O,F)  -> Choose(F)^2'))
-        model.add_rule(Rule('2: !ObjCooccur(O) & IsNearObj(O,F) -> !Choose(F)^2'))
-        model.add_rule(Rule('2: RoomCooccur(R) & IsNearRoom(R,F) -> Choose(F)^2'))
-        model.add_rule(Rule('2: !RoomCooccur(R) & IsNearRoom(R,F) -> !Choose(F)^2'))
-        model.add_rule(Rule('2: ShortDist(F) -> Choose(F)^2'))
-        model.add_rule(Rule('Choose(+F) = 1 .'))
-    
     def reset(self, object_category=None, object_category_sg=None):
         self.navigate_steps = 0
         self.turn_angles = 0
@@ -1680,19 +880,7 @@ class SG_Nav_Agent():
             self.obj_goal_sg = 'drawers'
         elif self.obj_goal == 'tv_monitor':
             self.obj_goal_sg = 'tv'
-        if bool(getattr(self, "_dump_motion_debug_json", False)):
-            reset_payload = {
-                "event": "reset",
-                "episode": int(self.count_episodes),
-                "step": int(self.total_steps),
-                "navigate_step": int(self.navigate_steps),
-                "obj_goal": str(self.obj_goal),
-                "obj_goal_sg": str(self.obj_goal_sg),
-            }
-            self._append_debug_jsonl(self.camera_map_sync_jsonl_path, reset_payload)
-            self._append_debug_jsonl(self.map_fusion_motion_jsonl_path, reset_payload)
         self._sync_glip_object_caption()
-        self._emit_coordinate_assumptions_once()
         self.current_obj_predictions = []
         self.obj_locations = [[] for _ in range(len(CANONICAL_MP3D_GOAL_ORDER))]
         self.not_move_steps = 0
@@ -1723,79 +911,9 @@ class SG_Nav_Agent():
             return str(a)
         return names[ai] if 0 <= ai < len(names) else str(a)
 
-    def _emit_spin_diagnosis(
-        self,
-        *,
-        early=None,
-        panorama=False,
-        goal_map_src=None,
-        number_action=None,
-        replan_fbe_hit=False,
-        stuck_reset_hit=False,
-        stuck_abort=False,
-        max_steps_stop=False,
-    ):
-        """stderr: classify why motion is mostly turn / exploration (not necessarily bug)."""
-        if not getattr(self, "_log_spin_diagnosis", True):
-            return
-        bbox_n = int(getattr(self, "_last_goal_bbox_n", 0))
-        fg, fpg = self.found_goal, self.found_possible_goal
-        an = self._act_action_name(number_action) if number_action is not None else "n/a"
-
-        if max_steps_stop:
-            cause = "episode_cap:total_steps>=500_emits_stop"
-        elif early:
-            cause = f"early_camera:{early}"
-        elif stuck_abort:
-            cause = "stuck_loop_abort:too_many_stuck_iterations_emits_stop"
-        elif panorama:
-            cause = "panorama_spin:step<=panorama_spin_until_step_and_no_fg_and_no_fpg"
-            if bbox_n == 0:
-                cause += "|detail=no_glip_goal_bbox"
-            else:
-                cause += "|detail=have_bbox_but_nav_flags_not_set_check_vote_depth"
-        elif goal_map_src is not None and number_action is not None:
-            na = int(number_action)
-            parts = []
-            if not fg and not fpg:
-                if bbox_n == 0:
-                    parts.append("spin_why=no_glip_match_for_obj_goal")
-                else:
-                    parts.append("spin_why=bbox_present_but_not_in_goal_nav_mode")
-            else:
-                parts.append("spin_why=heading_align_or_subgoal_in_object_nav")
-            gms = goal_map_src
-            if gms.startswith("replan_fbe") or gms.startswith("first_fbe"):
-                parts.append(f"explore={gms}")
-            elif "random" in gms:
-                parts.append(f"explore={gms}")
-            elif gms in ("found_goal", "possible_goal"):
-                parts.append("target=object_on_map")
-            elif gms == "gt_world_on_map":
-                parts.append("target=sim_world_xy_on_occupancy")
-            elif gms == "keep_previous_goal_map":
-                parts.append("map=unchanged_from_prior_step")
-            if replan_fbe_hit:
-                parts.append("replan_fbe=1")
-            if stuck_reset_hit:
-                parts.append("stuck_reset=1")
-            if na in (2, 3, 6):
-                parts.append("motion=turn_not_forward")
-            elif na == 1:
-                parts.append("motion=forward")
-            elif na == 0:
-                parts.append("motion=stop")
-            cause = "planner|" + ";".join(parts)
-        else:
-            cause = "unknown"
-
-        gms_s = f" goal_map_src={goal_map_src}" if goal_map_src is not None else ""
-        print(
-            f"[SG-Nav][spin] step={self.total_steps} cause={cause}{gms_s} "
-            f"bbox_n={bbox_n} fg={fg} fpg={fpg} not_move={self.not_move_steps} "
-            f"action={number_action}({an})",
-            flush=True,
-        )
+    def _emit_spin_diagnosis(self, **_kw):
+        """Spin diagnosis now goes to NavLogger; terminal output suppressed."""
+        pass
 
     def _resolve_nav_stage(
         self,
@@ -1875,14 +993,10 @@ class SG_Nav_Agent():
         if extra:
             extra_txt = " " + " ".join(extra)
         print(
-            "[SG-Nav][stage] "
-            f"step={self.total_steps} "
-            f"stage={stage_code} stage_zh={stage_zh} "
-            f"goal_map_src={src} "
-            f"found_goal={self.found_goal} found_possible_goal={self.found_possible_goal} "
-            f"using_random_goal={self.using_random_goal} active_gt_world_nav={self._active_gt_world_nav} "
-            f"action={number_action}({action_name})"
-            f"{extra_txt}",
+            f"[SG-Nav][stage] step={self.total_steps} "
+            f"stage={stage_code}({stage_zh}) "
+            f"action={number_action}({action_name}) "
+            f"src={src}{extra_txt}",
             flush=True,
         )
 
@@ -1899,16 +1013,6 @@ class SG_Nav_Agent():
             "prev_action": None if info.get("prev_action") is None else int(info.get("prev_action")),
         }
         self._client_collision_prev = parsed
-        if parsed["base_contact"]:
-            print(
-                "[SG-Nav][client_collision] "
-                f"step={self.total_steps} "
-                f"prev_action={parsed['prev_action']} "
-                f"n_contacts={parsed['n_contacts']} "
-                f"max_impulse={parsed['max_impulse']:.4f} "
-                f"bodies={parsed['contact_bodies']}",
-                flush=True,
-            )
 
     def _clear_possible_goal_nav_state(self):
         self.found_possible_goal = False
@@ -1951,27 +1055,13 @@ class SG_Nav_Agent():
             int(getattr(self, "_possible_goal_escape_cooldown", 0)) <= 0
         )
 
-        if (
-            self._log_goal_votes
-            and self.scenegraph.obj_goal not in self.scenegraph.small_objects
-            and len(goal_bbox) == 0
-        ):
-            n = len(obj_labels) if obj_labels is not None else 0
-            sample = [str(obj_labels[j]) for j in range(min(8, n))] if n else []
-            print(
-                "[SG-Nav][goal_vote] "
-                f"step={self.total_steps} goal={self.obj_goal!r} match_tokens={self._glip_goal_sg_match_tokens!r} "
-                f"bbox=0 n_glip={n} labels={sample}",
-                flush=True,
-            )
-        
         for j, label in enumerate(obj_labels):
             if label in CANONICAL_MP3D_GOAL_ORDER:
                 confidence = self.current_obj_predictions.get_field("scores")[j]
                 bbox = self.current_obj_predictions.bbox[j].to(torch.int64)
                 center_point = (bbox[:2] + bbox[2:]) // 2
-                temp_direction = self._horiz_angle_from_pixel_u(center_point[0])
-                temp_distance = self._depth_m_at_xy(center_point[0], center_point[1])
+                temp_direction = horiz_angle_from_pixel_u(center_point[0], self.sensor_width, self.hfov_deg)
+                temp_distance = depth_m_at_xy(self.depth, center_point[0], center_point[1])
                 if temp_distance >= self.distance_threshold:
                     continue
                 obj_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
@@ -1997,8 +1087,8 @@ class SG_Nav_Agent():
                 for mask in goal_mask:
                     center_point = torch.tensor(np.argwhere(mask).mean(axis=0).astype(int))
                     center_point = torch.tensor([center_point[1], center_point[0]])
-                    temp_direction = self._horiz_angle_from_pixel_u(center_point[0])
-                    temp_distance = self._depth_m_at_xy(center_point[0], center_point[1])
+                    temp_direction = horiz_angle_from_pixel_u(center_point[0], self.sensor_width, self.hfov_deg)
+                    temp_distance = depth_m_at_xy(self.depth, center_point[0], center_point[1])
                     k = 0
                     pos_neg = 1
                     dh, dw = int(self.depth.shape[0]), int(self.depth.shape[1])
@@ -2006,8 +1096,8 @@ class SG_Nav_Agent():
                         pos_neg *= -1
                         k += 0.5
                         temp_distance = max(
-                            self._depth_m_at_xy(center_point[0], center_point[1] + int(pos_neg * k)),
-                            self._depth_m_at_xy(center_point[0] + int(pos_neg * k), center_point[1]),
+                            depth_m_at_xy(self.depth, center_point[0], center_point[1] + int(pos_neg * k)),
+                            depth_m_at_xy(self.depth, center_point[0] + int(pos_neg * k), center_point[1]),
                         )
                         
                     if temp_distance >= self.distance_threshold:
@@ -2048,8 +1138,8 @@ class SG_Nav_Agent():
                 for box in goal_prediction.bbox:
                     box = box.to(torch.int64)
                     center_point = (box[:2] + box[2:]) // 2
-                    temp_direction = self._horiz_angle_from_pixel_u(center_point[0])
-                    temp_distance = self._depth_m_at_xy(center_point[0], center_point[1])
+                    temp_direction = horiz_angle_from_pixel_u(center_point[0], self.sensor_width, self.hfov_deg)
+                    temp_distance = depth_m_at_xy(self.depth, center_point[0], center_point[1])
                     goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
                     k = 0
                     pos_neg = 1
@@ -2058,8 +1148,8 @@ class SG_Nav_Agent():
                         pos_neg *= -1
                         k += 0.5
                         temp_distance = max(
-                            self._depth_m_at_xy(center_point[0], center_point[1] + int(pos_neg * k)),
-                            self._depth_m_at_xy(center_point[0] + int(pos_neg * k), center_point[1]),
+                            depth_m_at_xy(self.depth, center_point[0], center_point[1] + int(pos_neg * k)),
+                            depth_m_at_xy(self.depth, center_point[0] + int(pos_neg * k), center_point[1]),
                         )
                         
                     if temp_distance >= self.distance_threshold:
@@ -2105,17 +1195,6 @@ class SG_Nav_Agent():
                         or shortest_distance < 120
                     ):
                         self.found_possible_goal = True
-                if self._log_goal_votes:
-                    print(
-                        "[SG-Nav][goal_vote] "
-                        f"step={self.total_steps} goal={self.obj_goal!r} "
-                        f"bbox={len(goal_bbox)} far_ge_{self.distance_threshold}m={_vote_boxes_far} "
-                        f"near_map_ok={_vote_boxes_near} near_map_oob={_vote_boxes_near_oob} "
-                        f"vote_max={int(self.found_goal_times)}/{int(self.scenegraph.cfg.obj_min_detections)} "
-                        f"found_goal={self.found_goal} found_possible_goal={self.found_possible_goal}",
-                        flush=True,
-                    )
-
                 if self.found_goal:
                     goal_rows, goal_cols = np.where(
                         self.goal_gps_map == self.goal_gps_map.max()
@@ -2197,19 +1276,12 @@ class SG_Nav_Agent():
         run_scenegraph_update = (self.total_steps % self.scenegraph_update_interval) == 0
         if run_scenegraph_update:
             self.scenegraph.update_scenegraph()
-        elif self._nav_debug_trace:
-            print(
-                f"[SG-Nav][trace] step={self.total_steps} "
-                f"skip_scenegraph_update=1 interval={self.scenegraph_update_interval}",
-                flush=True,
-            )
 
         self._sync_camera_extrinsics(observations)
         self._maybe_suspend_mapping_due_to_fall()
         self.update_map(observations)
         self.update_free_map(observations)
         # Snapshot after depth->map update and before planning-only transforms.
-        self._log_mapping_snapshot(observations, traversible=None)
 
         # Run GLIP + room map before scripted camera returns. Legacy code returned TURN for steps 2–14
         # *before* any detection, so found_possible_goal stayed false and the agent never left panorama.
@@ -2224,7 +1296,7 @@ class SG_Nav_Agent():
                 )
                 self.update_room_map(observations, room_detection_result)
 
-        use_script_cam_tilt = not self._client_camera_pose_active(observations)
+        use_script_cam_tilt = not client_camera_pose_active(observations)
         if self.total_steps == 1:
             if use_script_cam_tilt:
                 self.sem_map_module.set_view_angles(30)
@@ -2266,12 +1338,6 @@ class SG_Nav_Agent():
             self.panoramic.append(observations["rgb"][:, :, [2, 1, 0]])
             self.panoramic_depth.append(observations["depth"])
             if self.total_steps <= spin_cap and (not self.found_goal and not self.found_possible_goal):
-                if self._nav_debug_trace:
-                    print(
-                        f"[SG-Nav][trace] step={self.total_steps} phase=panorama_spin_until_goal "
-                        f"found_goal={self.found_goal} found_possible_goal={self.found_possible_goal} action=6(TURN)",
-                        flush=True,
-                    )
                 self._emit_nav_stage(panorama=True, number_action=6)
                 self._emit_spin_diagnosis(panorama=True, number_action=6)
                 return {"action": 6}
@@ -2325,21 +1391,7 @@ class SG_Nav_Agent():
                 goal_r, goal_c, project_dist_cells = projected_goal
                 self.goal_map[goal_r, goal_c] = 1
                 goal_map_src = "possible_goal"
-                if project_dist_cells > 1e-6:
-                    print(
-                        "[SG-Nav][possible_goal_project] "
-                        f"step={self.total_steps} raw_rc=({int(goal_r_raw)},{int(goal_c_raw)}) "
-                        f"safe_rc=({int(goal_r)},{int(goal_c)}) "
-                        f"project_dist_cells={float(project_dist_cells):.2f}",
-                        flush=True,
-                    )
             else:
-                print(
-                    "[SG-Nav][possible_goal_project] "
-                    f"step={self.total_steps} raw_rc=({int(goal_r_raw)},{int(goal_c_raw)}) "
-                    "status=no_safe_known_cell fallback=frontier_or_random",
-                    flush=True,
-                )
                 self._clear_possible_goal_nav_state()
                 self.goal_loc = self.fbe(traversible, cur_start)
                 if self.goal_loc is None:
@@ -2380,12 +1432,6 @@ class SG_Nav_Agent():
             possible_goal_traversible = self._build_possible_goal_traversible()
             if possible_goal_traversible is not None:
                 traversible_plan = possible_goal_traversible
-                print(
-                    "[SG-Nav][possible_goal_plan] "
-                    f"step={self.total_steps} mode=explored_only "
-                    f"free_ratio={float(np.mean(possible_goal_traversible[1:-1,1:-1] > 0.5)):.4f}",
-                    flush=True,
-                )
         stg_y, stg_x, replan, number_action = self._plan(
             traversible_plan, goal_map_plan, self.full_pose, cur_start, cur_start_o, self.found_goal
         )
@@ -2458,27 +1504,6 @@ class SG_Nav_Agent():
                     # propagating STOP to the outer episode loop.
                     number_action = 6
                     self.not_move_steps = 0
-                    if isinstance(getattr(self, "_last_planner_debug", None), dict):
-                        self._last_planner_debug.update(
-                            {
-                                "possible_goal_stop_hold": True,
-                                "possible_goal_stop_streak": int(
-                                    self._possible_goal_stop_streak
-                                ),
-                                "possible_goal_stop_escape_steps": int(
-                                    self._possible_goal_stop_escape_steps
-                                ),
-                                "action": int(number_action),
-                            }
-                        )
-                    print(
-                        "[SG-Nav][possible_goal_stop] "
-                        f"step={self.total_steps} mode=hold_turn "
-                        f"streak={int(self._possible_goal_stop_streak)}/"
-                        f"{int(self._possible_goal_stop_escape_steps)} "
-                        f"cooldown={int(self._possible_goal_escape_cooldown)}",
-                        flush=True,
-                    )
                 else:
                     possible_goal_escape_hit = True
                     self._possible_goal_escape_cooldown = int(
@@ -2512,24 +1537,6 @@ class SG_Nav_Agent():
                         self.found_goal,
                     )
                     self.not_move_steps = 0
-                    if isinstance(getattr(self, "_last_planner_debug", None), dict):
-                        self._last_planner_debug.update(
-                            {
-                                "possible_goal_stop_escape": True,
-                                "possible_goal_stop_escape_cooldown": int(
-                                    self._possible_goal_escape_cooldown
-                                ),
-                                "action": int(number_action),
-                            }
-                        )
-                    print(
-                        "[SG-Nav][possible_goal_stop] "
-                        f"step={self.total_steps} mode=escape "
-                        f"escape_after={int(self._possible_goal_stop_escape_steps)} "
-                        f"cooldown={int(self._possible_goal_escape_cooldown)} "
-                        f"next_goal_map_src={goal_map_src}",
-                        flush=True,
-                    )
             else:
                 self._possible_goal_stop_streak = 0
         else:
@@ -2554,12 +1561,6 @@ class SG_Nav_Agent():
             self.loop_time += 1
             self.random_this_ex += 1
             if self.loop_time > 20:
-                if self._nav_debug_trace:
-                    print(
-                        f"[SG-Nav][trace] step={self.total_steps} phase=stuck_loop_abort "
-                        f"goal_map_src={goal_map_src} fg={self.found_goal} fpg={self.found_possible_goal}",
-                        flush=True,
-                    )
                 self._emit_nav_stage(
                     stuck_abort=True,
                     goal_map_src=goal_map_src,
@@ -2582,57 +1583,6 @@ class SG_Nav_Agent():
                 traversible, goal_map_plan, self.full_pose, cur_start, cur_start_o, self.found_goal
             )
         
-        if getattr(self, "_log_pose_align_trace", False):
-            dbg = getattr(self, "_last_planner_debug", None) or {}
-            comp_client = np.asarray(observations.get("compass_client", observations["compass"])).reshape(-1)
-            comp_proc = np.asarray(observations["compass"]).reshape(-1)
-            gps_client = np.asarray(observations.get("gps_client", observations["gps"])).reshape(-1)
-            gps_raw = np.asarray(observations.get("gps_raw", observations["gps"])).reshape(-1)
-            gps_proc = np.asarray(observations["gps"]).reshape(-1)
-            fp = self.full_pose.detach().cpu().numpy()
-            parts = [
-                f"step={self.total_steps}",
-                f"gps_client=[{float(gps_client[0]):.3f},{float(gps_client[1]):.3f}]",
-                f"gps_post_sign=[{float(gps_raw[0]):.3f},{float(gps_raw[1]):.3f}]",
-                f"gps_used=[{float(gps_proc[0]):.3f},{float(gps_proc[1]):.3f}]",
-                f"compass_client_rad={float(comp_client[0]):.4f}",
-                f"compass_post_offset_rad={float(comp_proc[0]):.4f}",
-                f"full_pose_m_deg=[{fp[0]:.3f},{fp[1]:.3f},{fp[2]:.2f}]",
-                f"map_size_cm={self.map_size_cm}",
-            ]
-            if np.all(np.isfinite(getattr(self, "origins", np.asarray([np.nan, np.nan])))[:2]):
-                parts.append(
-                    "gps_origin=["
-                    f"{float(self.origins[0]):.3f},{float(self.origins[1]):.3f}]"
-                )
-            if dbg.get("stop"):
-                parts.append("planner_stop=1")
-            elif "relative_angle_deg" in dbg:
-                parts.append(f"rel_deg={dbg['relative_angle_deg']:.2f}")
-                parts.append(f"agent_deg={dbg['angle_agent_deg']:.2f}")
-                parts.append(f"stg_bearing_deg={dbg['angle_st_goal_deg']:.2f}")
-                parts.append(
-                    f"align_thr={dbg['align_thr_deg']:.1f} fwd_exit={dbg['forward_exit_deg']:.1f}"
-                )
-                if dbg.get("align_thr_cfg_deg") is not None:
-                    parts.append(
-                        f"align_cfg={dbg['align_thr_cfg_deg']:.1f} fwd_exit_cfg={dbg['forward_exit_cfg_deg']:.1f}"
-                    )
-                if dbg.get("face_goal_only_deg", -1.0) >= 0.0:
-                    parts.append(
-                        f"face_eps={dbg['face_goal_only_deg']:.1f} face_eps_cfg={dbg['face_goal_only_cfg_deg']:.1f}"
-                    )
-            if dbg.get("observed_turn_deg") is not None:
-                parts.append(f"obs_turn_deg={dbg['observed_turn_deg']:.2f}")
-            if dbg.get("last_turn_delta_deg") is not None:
-                parts.append(f"last_turn_deg={dbg['last_turn_delta_deg']:.2f}")
-            parts.append(f"stg_ij={dbg.get('stg')}")
-            parts.append(
-                f"start_ij={dbg.get('start_ij')} start_o_deg={dbg.get('start_o_deg', float('nan')):.2f}"
-            )
-            parts.append(f"action={number_action}")
-            print("[SG-Nav][pose_align] " + " ".join(str(p) for p in parts), flush=True)
-
         self._goal_map_src_for_visualization = str(goal_map_src)
         if self.args.visualize:
             self.visualize(traversible, observations, number_action)
@@ -2657,31 +1607,6 @@ class SG_Nav_Agent():
         self.navigate_steps += 1
         if self._cuda_empty_cache_each_step and torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        if self._log_goal_cell_drift or self._nav_debug_trace:
-            act_names = ("STOP", "FWD", "LEFT", "RIGHT", "LOOK_UP", "LOOK_DOWN", "TURN")
-            an = act_names[int(number_action)] if 0 <= int(number_action) < len(act_names) else str(number_action)
-            drift_s = f" drift={goal_drift}" if goal_drift is not None else ""
-            rc_s = f" goal_rc={goal_rc}" if goal_rc is not None else " goal_rc=None"
-            if self._log_goal_cell_drift and not self._nav_debug_trace:
-                print(
-                    "[SG-Nav][goal_cell] "
-                    f"step={self.total_steps}{rc_s}{drift_s} src={goal_map_src} "
-                    f"replan_fbe={replan_fbe_hit} action={int(number_action)}({an})",
-                    flush=True,
-                )
-            elif self._nav_debug_trace:
-                print(
-                    "[SG-Nav][trace] "
-                    f"step={self.total_steps} goal_map_src={goal_map_src} "
-                    f"found_goal={self.found_goal} found_possible_goal={self.found_possible_goal} "
-                    f"replan_fbe={replan_fbe_hit} possible_goal_escape={possible_goal_escape_hit} "
-                    f"stuck_reset={stuck_reset_hit} "
-                    f"not_move_steps={self.not_move_steps} random_goal={self.using_random_goal} "
-                    f"{rc_s}{drift_s} "
-                    f"action={int(number_action)}({an})",
-                    flush=True,
-                )
 
         if goal_map_src != "keep_previous_goal_map":
             self._last_goal_map_src_effective = str(goal_map_src)
@@ -2739,12 +1664,6 @@ class SG_Nav_Agent():
         frontier_locations_plan = np.argwhere(frontier_map_plan)
         num_frontiers = int(frontier_locations_plan.shape[0])
         if num_frontiers == 0:
-            print(
-                "[SG-Nav][fbe] "
-                f"step={self.total_steps} status=no_frontiers "
-                f"frame={frame_mode}",
-                flush=True,
-            )
             return None
         
         # for each frontier, calculate the inverse of distance in planner frame
@@ -2776,16 +1695,6 @@ class SG_Nav_Agent():
         self.frontier_locations = frontier_locations_raw_b
         self.frontier_locations_16 = frontier_locations_16_raw_b
         if len(distances_16) == 0:
-            dmin = float(np.min(distances)) if len(distances) > 0 else float("nan")
-            dmax = float(np.max(distances)) if len(distances) > 0 else float("nan")
-            print(
-                "[SG-Nav][fbe] "
-                f"step={self.total_steps} status=no_eligible_frontier "
-                f"frontier_count={num_frontiers} "
-                f"distance_min={dmin:.3f} distance_max={dmax:.3f} "
-                "filter=distance>=1.6m",
-                flush=True,
-            )
             return None
         num_16_frontiers = len(idx_16[0])  # 175
 
@@ -2799,54 +1708,16 @@ class SG_Nav_Agent():
             int(np.clip(int(goal[1]), 0, self.map_size - 1)),
         )
         self.scores = scores
-        print(
-            "[SG-Nav][fbe] "
-            f"step={self.total_steps} status=select_frontier "
-            f"frontier_count={num_frontiers} eligible_count={num_16_frontiers} "
-            f"goal_rc=({goal[0]},{goal[1]}) "
-            f"score_max={float(np.max(scores)):.3f}",
-            flush=True,
-        )
         return goal
         
     def get_goal_gps(self, observations, angle, distance):
-        if type(angle) is torch.Tensor:
-            angle = angle.cpu().numpy()
-        agent_gps = observations['gps']
-        agent_compass = observations['compass']
-        # HTTP bridge uses OmniGibson ``z_angle_from_quat`` (+ optional runtime compass offset),
-        # so compass=0 aligns with world/map +x. Keep the legacy Habitat/ObjectNav convention here:
-        # forward = [cos(compass), -sin(compass)] in (gps_x, gps_y), and a positive image angle
-        # means the detection lies to the camera's right, i.e. rotate the forward heading clockwise.
-        goal_direction = agent_compass - angle / 180 * np.pi
-        goal_gps = np.array(
-            [
-                (agent_gps[0] + np.cos(goal_direction) * distance).item(),
-                (agent_gps[1] - np.sin(goal_direction) * distance).item(),
-            ]
-        )
-        return goal_gps
+        return _get_goal_gps_impl(observations['gps'], observations['compass'], angle, distance)
 
     def _goal_gps_to_raw_goal_map_rc(self, goal_gps):
-        """
-        Convert goal xy in the observation gps frame into raw ``goal_map`` row/col.
-        This matches ``get_traversible()``'s ``start_raw_pose`` convention.
-        """
-        gx = float(goal_gps[0])
-        gy = float(goal_gps[1])
-        half_cells = float(self.map_size_cm) / 10.0
-        r = int(round(half_cells - gy * 100.0 / float(self.resolution)))
-        c = int(round(half_cells + gx * 100.0 / float(self.resolution)))
-        r = max(0, min(self.map_size - 1, r))
-        c = max(0, min(self.map_size - 1, c))
-        return r, c
+        return goal_gps_to_map_rc(goal_gps, self.map_size_cm, self.resolution, self.map_size)
 
     def _raw_goal_map_rc_to_goal_gps(self, r: int, c: int):
-        """Inverse of ``_goal_gps_to_raw_goal_map_rc``."""
-        half_cells = float(self.map_size_cm) / 10.0
-        gx = (float(c) - half_cells) / 100.0 * float(self.resolution)
-        gy = (half_cells - float(r)) / 100.0 * float(self.resolution)
-        return np.array([gx, gy], dtype=np.float32)
+        return map_rc_to_goal_gps(r, c, self.map_size_cm, self.resolution)
 
     def _possible_goal_safe_mask_plan(self):
         free_core = getattr(self, "_last_free_from_depth_core", None)
@@ -2953,49 +1824,12 @@ class SG_Nav_Agent():
     def get_relative_goal_gps(self, observations, goal_gps=None):
         if goal_gps is None:
             goal_gps = self._get_active_goal_gps(observations)
-        if goal_gps is None or len(goal_gps) < 2:
-            return np.array([0.0, 0.0], dtype=np.float32)
-        direction_vector = goal_gps - np.array([observations['gps'][0].item(),observations['gps'][1].item()])
-        rho = np.sqrt(direction_vector[0]**2 + direction_vector[1]**2)
-        phi_world = np.arctan2(direction_vector[1], direction_vector[0])
-        agent_compass = observations['compass']
-        phi = phi_world - agent_compass
-        return np.array([rho, phi.item()], dtype=np.float32)
-
-    @staticmethod
-    def _wrap_angle_deg(angle_deg):
-        angle_deg = float(angle_deg)
-        angle_deg = (angle_deg + 180.0) % 360.0 - 180.0
-        return angle_deg
+        return _get_relative_goal_gps_impl(observations['gps'], observations['compass'], goal_gps)
 
     def _get_goal_stop_status(self, agent_pose, goal_gps=None):
         if goal_gps is None:
             goal_gps = getattr(self, "goal_gps", None)
-        if goal_gps is None or len(goal_gps) < 2:
-            return None
-        try:
-            goal_x = float(goal_gps[0])
-            goal_y = float(goal_gps[1])
-        except (TypeError, ValueError, IndexError):
-            return None
-        if not (math.isfinite(goal_x) and math.isfinite(goal_y)):
-            return None
-
-        half_map_m = float(self.map_size_cm) / 200.0
-        agent_x = float(agent_pose[0]) - half_map_m
-        agent_y = half_map_m - float(agent_pose[1])
-        dx = goal_x - agent_x
-        dy = goal_y - agent_y
-        rho = math.hypot(dx, dy)
-        bearing_deg = math.degrees(math.atan2(dy, dx))
-        heading_deg = float(agent_pose[2])
-        heading_error_deg = self._wrap_angle_deg(bearing_deg - heading_deg)
-        return {
-            "distance_m": float(rho),
-            "bearing_deg": float(bearing_deg),
-            "heading_deg": float(heading_deg),
-            "heading_error_deg": float(heading_error_deg),
-        }
+        return _get_goal_stop_status_impl(agent_pose, goal_gps, self.map_size_cm)
    
     def init_map(self):
         self.map_size = self.map_size_cm // self.map_resolution
@@ -3034,12 +1868,6 @@ class SG_Nav_Agent():
             return gps_arr
         if not np.all(np.isfinite(self.origins[:2])):
             self.origins = gps_arr[:2].astype(np.float32).copy()
-            if getattr(self, "_nav_debug_trace", False):
-                print(
-                    "[SG-Nav][gps_origin] "
-                    f"step={self.total_steps} origin=[{float(self.origins[0]):.3f},{float(self.origins[1]):.3f}]",
-                    flush=True,
-                )
         gps_arr[:2] -= self.origins[:2]
         return gps_arr
 
@@ -3076,9 +1904,10 @@ class SG_Nav_Agent():
         self._diag_prev_full_map_pose_deg = float(self.full_pose[2].detach().cpu().item())
         if self._consume_mapping_suspend("update_map"):
             return
-        fm_prev = None
-        if getattr(self, "_log_full_map_delta", False):
-            fm_prev = self.full_map[0, 0].detach().cpu().numpy().copy()
+        collect_fusion = bool(getattr(self.sem_map_module, "_diag_collect_fusion_stats", False))
+        fm_prev = (
+            self.full_map[0, 0].detach().cpu().numpy() if collect_fusion else None
+        )
         with torch.no_grad():
             self.full_map = self.sem_map_module(
                 torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device),
@@ -3126,64 +1955,6 @@ class SG_Nav_Agent():
             ring = np.logical_and(rr2 >= (4 ** 2), rr2 <= (10 ** 2))
             add_near = float(np.mean(np.logical_and(add_occ, near)))
             add_ring = float(np.mean(np.logical_and(add_occ, ring)))
-            camera_diag = getattr(self, "_last_camera_diag", None) or {}
-            cam_pitch_deg = float(camera_diag.get("sem_pitch_deg_used", float("nan")))
-            cam_height_cm = float(camera_diag.get("sem_height_cm_used", float("nan")))
-            cam_mode = str(camera_diag.get("mode", "unknown"))
-            if fusion_diag is not None:
-                print(
-                    "[SG-Nav][full_map_fuse] "
-                    f"step={self.total_steps} pose_source={map_pose_source} "
-                    f"warp={fusion_diag.get('warp_mode')} "
-                    f"patch_occ={int(fusion_diag.get('local_patch_occ_count', 0))} "
-                    f"translated_occ={int(fusion_diag.get('translated_occ_count', 0))} "
-                    f"prev_occ={int(fusion_diag.get('maps_last_occ_count', 0))} "
-                    f"overlap={int(fusion_diag.get('overlap_count', 0))} "
-                    f"overlap_ratio={float(fusion_diag.get('overlap_ratio', 0.0)):.4f} "
-                    f"patch_max={float(fusion_diag.get('local_patch_max', 0.0)):.3f} "
-                    f"translated_max={float(fusion_diag.get('translated_max', 0.0)):.3f}",
-                    flush=True,
-                )
-            print(
-                "[SG-Nav][full_map_delta] "
-                f"step={self.total_steps} occ_thr={occ_thr:.3f} "
-                f"prev_occ={float(np.mean(prev_occ)):.3f} now_occ={float(np.mean(now_occ)):.3f} "
-                f"add_occ={add_ratio:.4f} del_occ={del_ratio:.4f} "
-                f"local_occ={occ_local:.3f} local_add={add_local:.4f} "
-                f"local_prev_count={int(prev_local_count)} local_now_count={int(now_local_count)} "
-                f"local_add_count={int(add_local_count)} "
-                f"add_near={add_near:.4f} add_ring={add_ring:.4f} "
-                f"start_ij=({sy},{sx}) pose_source={map_pose_source} "
-                f"pose_delta_rc=({int(pose_delta_r)},{int(pose_delta_c)}) "
-                f"pose_delta_l2={float(pose_delta_l2):.3f} "
-                f"cam_mode={cam_mode} cam_pitch_deg={cam_pitch_deg:.3f} "
-                f"cam_height_cm={cam_height_cm:.3f}",
-                flush=True,
-            )
-            self._dump_map_fusion_motion_debug(
-                map_pose_source=map_pose_source,
-                pose_rc=pose_rc,
-                pose_delta_r=pose_delta_r,
-                pose_delta_c=pose_delta_c,
-                pose_delta_l2=pose_delta_l2,
-                fusion_diag=fusion_diag,
-                occ_thr=occ_thr,
-                prev_occ_ratio=float(np.mean(prev_occ)),
-                now_occ_ratio=float(np.mean(now_occ)),
-                add_ratio=add_ratio,
-                del_ratio=del_ratio,
-                occ_local=occ_local,
-                add_local=add_local,
-                add_local_count=add_local_count,
-                prev_local_count=prev_local_count,
-                now_local_count=now_local_count,
-                add_near=add_near,
-                add_ring=add_ring,
-                cam_mode=cam_mode,
-                cam_pitch_deg=cam_pitch_deg,
-                cam_height_cm=cam_height_cm,
-                start_ij=(sy, sx),
-            )
         # collision_map was a one-time numpy slice at init; full_map is a new tensor each step.
         # Reseed from current depth map first (depth-only path), then optionally fuse OG occupancy.
         if self._og_occ_reseed:
@@ -3198,20 +1969,11 @@ class SG_Nav_Agent():
         return
 
     def _robot_map_rc_from_full_pose(self, h: int, w: int) -> tuple[int, int]:
-        px = float(self.full_pose[0].detach().cpu().item())
-        py = float(self.full_pose[1].detach().cpu().item())
-        sy = int(round((float(self.map_size_cm) / 100.0 - py) * 100.0 / float(self.map_resolution)))
-        sx = int(round(px * 100.0 / float(self.map_resolution)))
-        sy = max(0, min(int(h) - 1, sy))
-        sx = max(0, min(int(w) - 1, sx))
-        return sy, sx
+        return robot_map_rc(self.full_pose, self.map_size_cm, self.resolution, h, w)
 
     @staticmethod
     def _disk_mask_for_center(h: int, w: int, cy: int, cx: int, radius_cells: int):
-        if int(radius_cells) <= 0:
-            return np.zeros((int(h), int(w)), dtype=bool)
-        yy, xx = np.ogrid[: int(h), : int(w)]
-        return ((yy - int(cy)) ** 2 + (xx - int(cx)) ** 2) <= (int(radius_cells) ** 2)
+        return disk_mask(h, w, cy, cx, radius_cells)
 
     def _fuse_og_occupancy_into_collision(self, observations):
         """
@@ -3310,107 +2072,15 @@ class SG_Nav_Agent():
                 score_vec,
             )
 
-    def _apply_map_frame_transform(self, arr, mode: str):
-        a = np.asarray(arr)
-        if mode == "id":
-            return a
-        if mode == "flipud":
-            return np.flipud(a)
-        if mode == "fliplr":
-            return np.fliplr(a)
-        if mode == "rot180":
-            return np.rot90(a, 2)
-        if mode == "rot90":
-            return np.rot90(a, 1)
-        if mode == "rot270":
-            return np.rot90(a, 3)
-        if mode == "transpose":
-            return np.transpose(a)
-        if mode == "transpose_flipud":
-            return np.flipud(np.transpose(a))
-        return a
+    def _apply_map_frame_transform(self, arr, mode: str = "flipud"):
+        return apply_flipud(arr)
 
-    def _transform_rc_by_frame_mode(self, r: int, c: int, h: int, w: int, mode: str):
-        rr, cc = int(r), int(c)
-        if mode == "id":
-            pass
-        elif mode == "flipud":
-            rr = h - 1 - rr
-        elif mode == "fliplr":
-            cc = w - 1 - cc
-        elif mode == "rot180":
-            rr = h - 1 - rr
-            cc = w - 1 - cc
-        elif mode == "rot90":
-            rr, cc = h - 1 - cc, rr
-        elif mode == "rot270":
-            rr, cc = cc, w - 1 - rr
-        elif mode == "transpose":
-            rr, cc = cc, rr
-        elif mode == "transpose_flipud":
-            rr, cc = h - 1 - cc, rr
-        rr = max(0, min(h - 1, rr))
-        cc = max(0, min(w - 1, cc))
-        return rr, cc
+    def _transform_rc_by_frame_mode(self, r: int, c: int, h: int, w: int, mode: str = "flipud"):
+        return transform_rc_flipud(r, c, h, w)
 
-    def _inverse_transform_rc_by_frame_mode(self, r: int, c: int, h: int, w: int, mode: str):
-        rr, cc = int(r), int(c)
-        if mode == "id":
-            pass
-        elif mode == "flipud":
-            rr = h - 1 - rr
-        elif mode == "fliplr":
-            cc = w - 1 - cc
-        elif mode == "rot180":
-            rr = h - 1 - rr
-            cc = w - 1 - cc
-        elif mode == "rot90":
-            rr, cc = cc, h - 1 - rr
-        elif mode == "rot270":
-            rr, cc = w - 1 - cc, rr
-        elif mode == "transpose":
-            rr, cc = cc, rr
-        elif mode == "transpose_flipud":
-            rr, cc = cc, h - 1 - rr
-        rr = max(0, min(h - 1, rr))
-        cc = max(0, min(w - 1, cc))
-        return rr, cc
+    def _inverse_transform_rc_by_frame_mode(self, r: int, c: int, h: int, w: int, mode: str = "flipud"):
+        return inverse_transform_rc_flipud(r, c, h, w)
 
-    def _auto_select_map_frame_transform(self, obs_from_depth, obs_from_collision, free_from_depth, start):
-        # Baseline SG_Nav_0 used only vertical flip ([::-1]) before traversible.
-        # Restrict candidates to avoid accidental 90deg frame mis-selection on symmetric local patterns.
-        modes = ["id", "flipud"]
-        win = int(getattr(self, "_map_frame_auto_select_win_cells", 40))
-        sy = int(start[0])
-        sx = int(start[1])
-        scores = {}
-        best_mode = "id"
-        best_score = -1e9
-        prev_mode = str(getattr(self, "_last_map_frame_transform", "id"))
-        for mode in modes:
-            od = self._apply_map_frame_transform(obs_from_depth, mode)
-            oc = self._apply_map_frame_transform(obs_from_collision, mode)
-            fr = self._apply_map_frame_transform(free_from_depth, mode)
-            y0 = max(0, sy - win)
-            y1 = min(od.shape[0], sy + win + 1)
-            x0 = max(0, sx - win)
-            x1 = min(od.shape[1], sx + win + 1)
-            if y1 <= y0 or x1 <= x0:
-                local_known = 0.0
-                local_obs = 0.0
-            else:
-                known = np.logical_or(np.logical_or(od[y0:y1, x0:x1], oc[y0:y1, x0:x1]), fr[y0:y1, x0:x1])
-                local_known = float(np.mean(known))
-                local_obs = float(np.mean(np.logical_or(od[y0:y1, x0:x1], oc[y0:y1, x0:x1])))
-            score = local_known + 0.25 * local_obs
-            if mode == prev_mode:
-                score += 1e-3  # tiny hysteresis to avoid mode flapping on ties
-            scores[mode] = score
-            if score > best_score:
-                best_score = score
-                best_mode = mode
-        return best_mode, scores
-    
     def get_traversible(self, map_pred, pose_pred):
         grid = np.asarray(map_pred, dtype=np.float32)
         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = pose_pred
@@ -3520,141 +2190,6 @@ class SG_Nav_Agent():
         if vy1 > vy0 and vx1 > vx0:
             self.visited[gy1:gy2, gx1:gx2][vy0:vy1, vx0:vx1] = 1
 
-        if getattr(self, "_log_mapping_stats", False):
-            def _local_ratio(arr, cy, cx, win=40):
-                y0 = max(0, int(cy) - win)
-                y1 = min(arr.shape[0], int(cy) + win + 1)
-                x0 = max(0, int(cx) - win)
-                x1 = min(arr.shape[1], int(cx) + win + 1)
-                if y1 <= y0 or x1 <= x0:
-                    return float("nan")
-                return float(np.mean(arr[y0:y1, x0:x1]))
-
-            def _q(v, p):
-                if v.size <= 0:
-                    return float("nan")
-                return float(np.quantile(v, p))
-
-            def _local_vec(arr, cy, cx, win=40):
-                y0 = max(0, int(cy) - win)
-                y1 = min(arr.shape[0], int(cy) + win + 1)
-                x0 = max(0, int(cx) - win)
-                x1 = min(arr.shape[1], int(cx) + win + 1)
-                if y1 <= y0 or x1 <= x0:
-                    return np.asarray([], dtype=np.float32)
-                return np.asarray(arr[y0:y1, x0:x1], dtype=np.float32).reshape(-1)
-
-            obs_union_raw = np.logical_or(obs_from_depth_raw, obs_from_collision_raw)
-            obs_union_plan = np.logical_or(obs_from_depth, obs_from_collision)
-            free_on_obs = float(np.mean(np.logical_and(free_from_depth_raw, obs_union_raw)))
-            free_non_obs = float(np.mean(np.logical_and(free_from_depth_raw, np.logical_not(obs_union_raw))))
-            free_total = float(np.mean(free_from_depth_raw))
-            free_conflict_ratio = (
-                free_on_obs / max(free_total, 1e-6) if math.isfinite(free_total) else float("nan")
-            )
-
-            full_l_plan = _local_ratio(obs_from_depth, sy_plan, sx_plan)
-            coll_l_plan = _local_ratio(obs_from_collision, sy_plan, sx_plan)
-            free_l_plan = _local_ratio(free_from_depth, sy_plan, sx_plan)
-            known_l_plan = _local_ratio(np.logical_or(obs_union_plan, free_from_depth), sy_plan, sx_plan)
-            full_l_raw_ref = _local_ratio(obs_from_depth_raw, sy_raw, sx_raw)
-            coll_l_raw_ref = _local_ratio(obs_from_collision_raw, sy_raw, sx_raw)
-            free_l_raw_ref = _local_ratio(free_from_depth_raw, sy_raw, sx_raw)
-            known_l_raw_ref = _local_ratio(np.logical_or(obs_union_raw, free_from_depth_raw), sy_raw, sx_raw)
-            edge_margin_plan = int(min(sy_plan, h - 1 - sy_plan, sx_plan, w - 1 - sx_plan))
-            nearest_occ_plan_d = float("nan")
-            nearest_occ_plan_rc = None
-            occ_rc = np.argwhere(obs_union_plan)
-            if occ_rc.shape[0] > 0:
-                d2 = (occ_rc[:, 0] - int(sy_plan)) ** 2 + (occ_rc[:, 1] - int(sx_plan)) ** 2
-                j = int(np.argmin(d2))
-                nearest_occ_plan_d = float(np.sqrt(float(d2[j])))
-                nearest_occ_plan_rc = (int(occ_rc[j, 0]), int(occ_rc[j, 1]))
-            print(
-                "[SG-Nav][map_diag] "
-                f"step={self.total_steps} frame={frame_mode} "
-                f"global_plan[full,coll,free]=[{float(np.mean(obs_from_depth)):.3f},"
-                f"{float(np.mean(obs_from_collision)):.3f},{float(np.mean(free_from_depth)):.3f}] "
-                f"local_plan[full,coll,free,known]=[{full_l_plan:.3f},{coll_l_plan:.3f},{free_l_plan:.3f},{known_l_plan:.3f}] "
-                f"local_raw_ref[full,coll,free,known]=[{full_l_raw_ref:.3f},{coll_l_raw_ref:.3f},{free_l_raw_ref:.3f},{known_l_raw_ref:.3f}] "
-                f"free_raw[non_obs,conflict,conflict_ratio]=[{free_non_obs:.3f},{free_on_obs:.3f},{free_conflict_ratio:.3f}] "
-                f"start_plan=({sy_plan},{sx_plan}) start_raw_ref=({sy_raw},{sx_raw}) "
-                f"start_pick={start_pick_mode} pick_score={start_pick_score:.3f} pick_score_alt={start_pick_score_alt:.3f} "
-                f"start_pose_raw=({sy_raw_pose},{sx_raw_pose}) start_pose_plan=({int(sy_plan_pose)},{int(sx_plan_pose)}) "
-                f"edge_margin_plan={edge_margin_plan} "
-                f"nearest_occ_plan_d={nearest_occ_plan_d:.1f} nearest_occ_plan_rc={nearest_occ_plan_rc}",
-                flush=True,
-            )
-            if (
-                edge_margin_plan <= int(getattr(self, "_map_edge_warn_margin_cells", 0))
-                and full_l_plan >= float(getattr(self, "_map_edge_warn_local_occ_min", 1.0))
-                and float(np.mean(obs_from_depth)) <= float(getattr(self, "_map_edge_warn_global_occ_max", 0.0))
-                and free_l_plan <= float(getattr(self, "_map_edge_warn_local_free_max", 0.0))
-            ):
-                print(
-                    "[SG-Nav][map_edge_warn] "
-                    f"step={self.total_steps} frame={frame_mode} "
-                    f"edge_margin={edge_margin_plan} "
-                    f"local_occ={full_l_plan:.3f} local_free={free_l_plan:.3f} "
-                    f"global_occ={float(np.mean(obs_from_depth)):.3f} "
-                    f"hint=increase_map_size_cm_or_check_depth_projection",
-                    flush=True,
-                )
-
-            if bool(getattr(self, "_log_free_map_distribution", True)):
-                fg_raw = np.asarray(free_map, dtype=np.float32).reshape(-1)
-                fg_plan = np.asarray(free_map_plan, dtype=np.float32).reshape(-1)
-                fl_raw = _local_vec(free_map, sy_raw, sx_raw)
-                fl_plan = _local_vec(free_map_plan, sy_plan, sx_plan)
-                raw_gt0 = float(np.mean(fg_raw > 1e-6)) if fg_raw.size > 0 else float("nan")
-                raw_ge_thr = float(np.mean(fg_raw > free_thr)) if fg_raw.size > 0 else float("nan")
-                plan_gt0 = float(np.mean(fg_plan > 1e-6)) if fg_plan.size > 0 else float("nan")
-                plan_ge_thr = float(np.mean(fg_plan > free_thr)) if fg_plan.size > 0 else float("nan")
-                lraw_gt0 = float(np.mean(fl_raw > 1e-6)) if fl_raw.size > 0 else float("nan")
-                lraw_ge_thr = float(np.mean(fl_raw > free_thr)) if fl_raw.size > 0 else float("nan")
-                lplan_gt0 = float(np.mean(fl_plan > 1e-6)) if fl_plan.size > 0 else float("nan")
-                lplan_ge_thr = float(np.mean(fl_plan > free_thr)) if fl_plan.size > 0 else float("nan")
-                print(
-                    "[SG-Nav][free_diag] "
-                    f"step={self.total_steps} frame={frame_mode} thr={free_thr:.3f} "
-                    f"global_raw[p50,p90,p99,max]=[{_q(fg_raw,0.50):.3f},{_q(fg_raw,0.90):.3f},{_q(fg_raw,0.99):.3f},{_q(fg_raw,1.00):.3f}] "
-                    f"global_plan[p50,p90,p99,max]=[{_q(fg_plan,0.50):.3f},{_q(fg_plan,0.90):.3f},{_q(fg_plan,0.99):.3f},{_q(fg_plan,1.00):.3f}] "
-                    f"global_pass_raw[gt0,ge_thr]=[{raw_gt0:.4f},{raw_ge_thr:.4f}] "
-                    f"global_pass_plan[gt0,ge_thr]=[{plan_gt0:.4f},{plan_ge_thr:.4f}] "
-                    f"local_raw_ref[p50,p90,p99,max]=[{_q(fl_raw,0.50):.3f},{_q(fl_raw,0.90):.3f},{_q(fl_raw,0.99):.3f},{_q(fl_raw,1.00):.3f}] "
-                    f"local_plan[p50,p90,p99,max]=[{_q(fl_plan,0.50):.3f},{_q(fl_plan,0.90):.3f},{_q(fl_plan,0.99):.3f},{_q(fl_plan,1.00):.3f}] "
-                    f"local_pass_raw[gt0,ge_thr]=[{lraw_gt0:.4f},{lraw_ge_thr:.4f}] "
-                    f"local_pass_plan[gt0,ge_thr]=[{lplan_gt0:.4f},{lplan_ge_thr:.4f}]",
-                    flush=True,
-                )
-            if bool(getattr(self, "_log_obstacle_map_distribution", True)):
-                occ_raw_v = np.asarray(occ_map, dtype=np.float32).reshape(-1)
-                occ_plan_v = np.asarray(occ_map_plan, dtype=np.float32).reshape(-1)
-                coll_raw_v = np.asarray(coll_map, dtype=np.float32).reshape(-1)
-                coll_plan_v = np.asarray(coll_map_plan, dtype=np.float32).reshape(-1)
-                occ_l_raw_v = _local_vec(occ_map, sy_raw, sx_raw)
-                occ_l_plan_v = _local_vec(occ_map_plan, sy_plan, sx_plan)
-                coll_l_raw_v = _local_vec(coll_map, sy_raw, sx_raw)
-                coll_l_plan_v = _local_vec(coll_map_plan, sy_plan, sx_plan)
-                occ_thr = float(self._traversible_occ_from_depth_min)
-                print(
-                    "[SG-Nav][obs_diag] "
-                    f"step={self.total_steps} frame={frame_mode} occ_thr={occ_thr:.3f} coll_thr=0.500 "
-                    f"occ_global_raw[p50,p90,p99,max]=[{_q(occ_raw_v,0.50):.3f},{_q(occ_raw_v,0.90):.3f},{_q(occ_raw_v,0.99):.3f},{_q(occ_raw_v,1.00):.3f}] "
-                    f"occ_global_plan[p50,p90,p99,max]=[{_q(occ_plan_v,0.50):.3f},{_q(occ_plan_v,0.90):.3f},{_q(occ_plan_v,0.99):.3f},{_q(occ_plan_v,1.00):.3f}] "
-                    f"occ_global_pass_raw[ge_occ_thr,ge_0.5]=[{float(np.mean(occ_raw_v >= occ_thr)):.4f},{float(np.mean(occ_raw_v >= 0.5)):.4f}] "
-                    f"occ_global_pass_plan[ge_occ_thr,ge_0.5]=[{float(np.mean(occ_plan_v >= occ_thr)):.4f},{float(np.mean(occ_plan_v >= 0.5)):.4f}] "
-                    f"occ_local_raw_ref[p50,p90,p99,max]=[{_q(occ_l_raw_v,0.50):.3f},{_q(occ_l_raw_v,0.90):.3f},{_q(occ_l_raw_v,0.99):.3f},{_q(occ_l_raw_v,1.00):.3f}] "
-                    f"occ_local_plan[p50,p90,p99,max]=[{_q(occ_l_plan_v,0.50):.3f},{_q(occ_l_plan_v,0.90):.3f},{_q(occ_l_plan_v,0.99):.3f},{_q(occ_l_plan_v,1.00):.3f}] "
-                    f"occ_local_pass_raw[ge_occ_thr,ge_0.5]=[{float(np.mean(occ_l_raw_v >= occ_thr)):.4f},{float(np.mean(occ_l_raw_v >= 0.5)):.4f}] "
-                    f"occ_local_pass_plan[ge_occ_thr,ge_0.5]=[{float(np.mean(occ_l_plan_v >= occ_thr)):.4f},{float(np.mean(occ_l_plan_v >= 0.5)):.4f}] "
-                    f"coll_global_raw[p50,p90,p99,max]=[{_q(coll_raw_v,0.50):.3f},{_q(coll_raw_v,0.90):.3f},{_q(coll_raw_v,0.99):.3f},{_q(coll_raw_v,1.00):.3f}] "
-                    f"coll_global_plan[p50,p90,p99,max]=[{_q(coll_plan_v,0.50):.3f},{_q(coll_plan_v,0.90):.3f},{_q(coll_plan_v,0.99):.3f},{_q(coll_plan_v,1.00):.3f}] "
-                    f"coll_local_raw_ref[p50,p90,p99,max]=[{_q(coll_l_raw_v,0.50):.3f},{_q(coll_l_raw_v,0.90):.3f},{_q(coll_l_raw_v,0.99):.3f},{_q(coll_l_raw_v,1.00):.3f}] "
-                    f"coll_local_plan[p50,p90,p99,max]=[{_q(coll_l_plan_v,0.50):.3f},{_q(coll_l_plan_v,0.90):.3f},{_q(coll_l_plan_v,0.99):.3f},{_q(coll_l_plan_v,1.00):.3f}]",
-                    flush=True,
-                )
-
         inter = float(np.sum(np.logical_and(obs_from_depth, obs_from_collision)))
         union = float(np.sum(np.logical_or(obs_from_depth, obs_from_collision)))
         depth_n = float(np.sum(obs_from_depth))
@@ -3684,79 +2219,6 @@ class SG_Nav_Agent():
                 obs_from_collision[-b:, :] = False
                 obs_from_collision[:, :b] = False
                 obs_from_collision[:, -b:] = False
-                if getattr(self, "_log_mapping_stats", False):
-                    print(
-                        "[SG-Nav][border_clear] "
-                        f"step={self.total_steps} frame={frame_mode} cells={b}",
-                        flush=True,
-                    )
-        if getattr(self, "_log_mapping_stats", False):
-            win = 40
-            y0 = max(0, sy_plan - win)
-            y1w = min(obs_from_depth.shape[0], sy_plan + win + 1)
-            x0 = max(0, sx_plan - win)
-            x1w = min(obs_from_depth.shape[1], sx_plan + win + 1)
-            if y1w > y0 and x1w > x0:
-                occ_depth_local = float(np.mean(obs_from_depth[y0:y1w, x0:x1w]))
-                occ_collision_local = float(np.mean(obs_from_collision[y0:y1w, x0:x1w]))
-                free_depth_local = float(np.mean(free_from_depth[y0:y1w, x0:x1w]))
-                inter_l = float(
-                    np.sum(
-                        np.logical_and(
-                            obs_from_depth[y0:y1w, x0:x1w],
-                            obs_from_collision[y0:y1w, x0:x1w],
-                        )
-                    )
-                )
-                union_l = float(
-                    np.sum(
-                        np.logical_or(
-                            obs_from_depth[y0:y1w, x0:x1w],
-                            obs_from_collision[y0:y1w, x0:x1w],
-                        )
-                    )
-                )
-                depth_l = float(np.sum(obs_from_depth[y0:y1w, x0:x1w]))
-                coll_l = float(np.sum(obs_from_collision[y0:y1w, x0:x1w]))
-                occ_iou_local = (inter_l / union_l) if union_l > 0.0 else float("nan")
-                occ_precision_local = (inter_l / coll_l) if coll_l > 0.0 else float("nan")
-                occ_recall_local = (inter_l / depth_l) if depth_l > 0.0 else float("nan")
-            else:
-                occ_depth_local = float("nan")
-                occ_collision_local = float("nan")
-                free_depth_local = float("nan")
-                occ_iou_local = float("nan")
-                occ_precision_local = float("nan")
-                occ_recall_local = float("nan")
-            print(
-                "[SG-Nav][occ_align] "
-                f"step={self.total_steps} frame={frame_mode} "
-                f"iou={occ_iou:.3f} prec={occ_precision:.3f} rec={occ_recall:.3f} "
-                f"iou_local={occ_iou_local:.3f} prec_local={occ_precision_local:.3f} "
-                f"rec_local={occ_recall_local:.3f}",
-                flush=True,
-            )
-            print(
-                "[SG-Nav][occ_diag] "
-                f"step={self.total_steps} occ_depth={float(np.mean(obs_from_depth)):.3f} "
-                f"occ_collision={float(np.mean(obs_from_collision)):.3f} "
-                f"free_depth={float(np.mean(free_from_depth)):.3f} "
-                f"occ_depth_local={occ_depth_local:.3f} "
-                f"occ_collision_local={occ_collision_local:.3f} "
-                f"free_depth_local={free_depth_local:.3f} "
-                f"frame={frame_mode}",
-                flush=True,
-            )
-            if self._log_map_frame_select:
-                if frame_scores is None:
-                    score_text = "fixed"
-                else:
-                    score_text = " ".join(f"{k}:{v:.3f}" for k, v in frame_scores.items())
-                print(
-                    "[SG-Nav][frame_select] "
-                    f"step={self.total_steps} selected={frame_mode} scores={score_text}",
-                    flush=True,
-                )
         selem = skimage.morphology.disk(int(self._traversible_obstacle_inflation_cells))
         obs_core = np.logical_or(obs_from_depth, obs_from_collision)
         obs_dilated = skimage.morphology.binary_dilation(obs_core, selem)
@@ -3778,16 +2240,7 @@ class SG_Nav_Agent():
                 local = rr2 <= int(self._traversible_bootstrap_radius_cells) ** 2
                 local_non_obs = np.logical_and(local, np.logical_not(obs_dilated))
                 traversible = np.logical_or(traversible, local_non_obs)
-                print(
-                    "[SG-Nav][traversible_bootstrap] "
-                    f"step={self.total_steps} tr_ratio={tr_ratio:.4f} "
-                    f"radius_cells={int(self._traversible_bootstrap_radius_cells)}",
-                    flush=True,
-                )
 
-        if not traversible[sy_plan, sx_plan]:
-            print("Not traversible, step is  ", self.navigate_steps)
-        
         sy = int(sy_plan - y1)
         sx = int(sx_plan - x1)
         y0s = max(0, sy - 1)
@@ -3814,39 +2267,10 @@ class SG_Nav_Agent():
         self._last_traversible_start = (int(sy_plan), int(sx_plan))
         self._last_traversible_frame_mode = str(frame_mode)
         traversible = add_boundary(traversible)
-        self._log_mapping_snapshot({"depth": self.depth}, traversible=traversible)
         return traversible, start_plan, start_o
 
     def _world_xy_m_to_grid_rc_for_nav(self, tx: float, ty: float) -> tuple[int, int]:
-        """
-        Map grid (row, col) from absolute world meters.
-
-        Keep this in the exact same raw-map convention as:
-        - ``get_traversible()``'s ``start_raw_pose``
-        - ``_goal_gps_to_raw_goal_map_rc()``
-
-        For the HTTP client, ``world_xy`` is absolute OmniGibson world position while
-        ``goal_gps`` is map-centered Habitat-style coordinates:
-
-          gps_x = world_x - half_map_m
-          gps_y = half_map_m - world_y
-
-        Feeding that through ``_goal_gps_to_raw_goal_map_rc()`` lands on:
-
-          row = world_y / cell_size
-          col = world_x / cell_size
-
-        The previous implementation used ``map_size - world_y`` for the row, which
-        vertically mirrored ``target_world_xy`` goals versus every other navigation
-        target source. That made ``gt_world_on_map`` plan toward the wrong cell.
-        """
-        cell_m = float(self.map_resolution) / 100.0
-        r = int(round(float(ty) / cell_m))
-        c = int(round(float(tx) / cell_m))
-        return (
-            max(0, min(self.map_size - 1, r)),
-            max(0, min(self.map_size - 1, c)),
-        )
+        return world_xy_to_grid_rc(tx, ty, self.resolution, self.map_size)
 
     def _target_world_cell_visible_on_map(self, r: int, c: int, radius: int = 3) -> bool:
         """True if visited, free-space, or semantic map has evidence near (r, c)."""
@@ -3885,16 +2309,6 @@ class SG_Nav_Agent():
             return False
         r_abs, c_abs = self._world_xy_m_to_grid_rc_for_nav(tx, ty)
         visible_abs = self._target_world_cell_visible_on_map(r_abs, c_abs)
-
-        if getattr(self, "_log_pose_align_trace", False) or getattr(self, "_nav_debug_trace", False):
-            parts = [
-                f"step={self.total_steps}",
-                f"target_world_xy=[{tx:.3f},{ty:.3f}]",
-                f"target_rc=({int(r_abs)},{int(c_abs)})",
-                f"visible={int(bool(visible_abs))}",
-                f"active_gt_world_nav={int(bool(getattr(self, '_active_gt_world_nav', False)))}",
-            ]
-            print("[SG-Nav][gt_world_diag] " + " ".join(parts), flush=True)
 
         if not visible_abs:
             return False
@@ -4031,25 +2445,6 @@ class SG_Nav_Agent():
                             newly_marked += 1
                         painted.append((int(r), int(c)))
                         self.collision_map[r,c] = 1
-                if getattr(self, "_log_collision_paint", False):
-                    uniq = sorted(set(painted))
-                    if len(uniq) > 0:
-                        rs = [p[0] for p in uniq]
-                        cs = [p[1] for p in uniq]
-                        span = f"r=[{min(rs)},{max(rs)}] c=[{min(cs)},{max(cs)}]"
-                    else:
-                        span = "r=[nan,nan] c=[nan,nan]"
-                    print(
-                        "[SG-Nav][collision_paint] "
-                        f"step={self.total_steps} dist={float(dist):.4f} thr={float(col_threshold):.4f} "
-                        f"prev_action={int(self.prev_action)} former_collide={int(self.former_collide)} "
-                        f"reason={'+'.join(collision_reasons)} "
-                        f"n_samples={int(length)} n_unique={len(uniq)} n_new={int(newly_marked)} "
-                        f"client_n_contacts={int(client_collision.get('n_contacts', 0))} "
-                        f"client_max_impulse={float(client_collision.get('max_impulse', 0.0)):.4f} "
-                        f"{span} heading_deg={float(t1):.2f}",
-                        flush=True,
-                    )
             else:
                 self.former_collide = 0
 
@@ -4061,18 +2456,6 @@ class SG_Nav_Agent():
         if stop:
             action = 0
             (stg_y, stg_x) = stg
-            if getattr(self, "_log_pose_align_trace", False):
-                self._last_planner_debug = {
-                    "stop": True,
-                    "stg": (int(stg_y), int(stg_x)),
-                    "start_ij": (int(start[0]), int(start[1])),
-                    "start_o_deg": float(start_o),
-                    "observed_turn_deg": None if getattr(self, "_planner_observed_turn_deg", None) is None else float(self._planner_observed_turn_deg),
-                    "last_turn_delta_deg": None if getattr(self, "_planner_last_turn_delta_deg", None) is None else float(self._planner_last_turn_delta_deg),
-                    "replan": bool(replan),
-                    "action": int(action),
-                }
-
         else:
             (stg_y, stg_x) = stg
             angle_st_goal = math.degrees(math.atan2(stg_y - start[0],
@@ -4191,52 +2574,6 @@ class SG_Nav_Agent():
                     else:
                         action = 3
                         turn_pick = "default_right"
-                    act_names = ("STOP", "FWD", "LEFT", "RIGHT", "LOOK_UP", "LOOK_DOWN", "TURN")
-                    an_raw = act_names[action_raw] if 0 <= action_raw < len(act_names) else str(action_raw)
-                    an_used = act_names[int(action)] if 0 <= int(action) < len(act_names) else str(int(action))
-                    br, bc = fg_info.get("block_rc", (None, None))
-                    btype = fg_info.get("block_type", "unknown")
-                    print(
-                        "[SG-Nav][forward_guard] "
-                        f"step={self.total_steps} "
-                        f"action_raw={action_raw}({an_raw})->action_used={int(action)}({an_used}) "
-                        f"start_ij=({int(start[0])},{int(start[1])}) start_o_deg={float(start_o):.2f} "
-                        f"rel_deg={float(relative_angle):.2f} "
-                        f"block_rc=({br},{bc}) block_type={btype} "
-                        f"sample_idx={fg_info.get('sample_idx')} dist_cells={fg_info.get('dist_cells')} "
-                        f"ray_idx={fg_info.get('ray_idx')} n_rays={fg_info.get('n_rays')} "
-                        f"cone_half_deg={fg_info.get('cone_half_deg')} "
-                        f"lookahead_cells={fg_info.get('lookahead_cells')} samples={fg_info.get('samples')} "
-                        f"frame={fg_info.get('frame_mode')} turn_pick={turn_pick}",
-                        flush=True,
-                    )
-
-            if getattr(self, "_log_pose_align_trace", False):
-                self._last_planner_debug = {
-                    "stop": False,
-                    "stg": (int(stg_y), int(stg_x)),
-                    "start_ij": (int(start[0]), int(start[1])),
-                    "start_o_deg": float(start_o),
-                    "angle_st_goal_deg": float(angle_st_goal),
-                    "angle_agent_deg": float(angle_agent),
-                    "relative_angle_deg": float(relative_angle),
-                    "align_thr_deg": float(align_thr),
-                    "align_thr_cfg_deg": float(align_thr_cfg),
-                    "forward_exit_deg": float(forward_exit),
-                    "forward_exit_cfg_deg": float(forward_exit_cfg),
-                    "face_goal_only_deg": float(face_eps) if use_strict_face_goal else -1.0,
-                    "face_goal_only_cfg_deg": float(face_eps_cfg) if use_strict_face_goal else -1.0,
-                    "observed_turn_deg": None if observed_turn_deg is None else float(observed_turn_deg),
-                    "last_turn_delta_deg": None if getattr(self, "_planner_last_turn_delta_deg", None) is None else float(self._planner_last_turn_delta_deg),
-                    "prev_action": int(self.prev_action),
-                    "former_collide": int(self.former_collide),
-                    "replan": bool(replan),
-                    "action_raw": int(action_raw),
-                    "forward_guard_blocked": bool(fg_blocked),
-                    "action": int(action),
-                }
-                if fg_info is not None:
-                    self._last_planner_debug["forward_guard_info"] = fg_info
 
         if (
             goal_found
@@ -4254,26 +2591,6 @@ class SG_Nav_Agent():
                 action = 2
             else:
                 action = 3
-
-            if getattr(self, "_log_pose_align_trace", False):
-                if not isinstance(getattr(self, "_last_planner_debug", None), dict):
-                    self._last_planner_debug = {}
-                self._last_planner_debug.update(
-                    {
-                        "goal_stop_override": True,
-                        "goal_stop_distance_m": float(goal_stop_state["distance_m"]),
-                        "goal_stop_heading_error_deg": float(
-                            goal_stop_state["heading_error_deg"]
-                        ),
-                        "goal_stop_distance_thr_m": float(
-                            self._goal_stop_distance_threshold_m
-                        ),
-                        "goal_stop_face_thr_deg": float(
-                            self._goal_stop_face_threshold_deg
-                        ),
-                        "action": int(action),
-                    }
-                )
 
         return stg_y, stg_x, replan, action
     
@@ -4374,13 +2691,6 @@ class SG_Nav_Agent():
             else:
                 h_goal = np.random.choice(goal.shape[0], 1)[0]
                 w_goal = np.random.choice(goal.shape[1], 1)[0]
-        elif getattr(self, "_nav_debug_trace", False):
-            print(
-                "[SG-Nav][random_goal] "
-                f"step={self.total_steps} rc_raw=({int(goal_candidates_raw[0])},{int(goal_candidates_raw[1])}) "
-                f"candidates={int(goal_candidates_raw[2])} frame={frame_mode}",
-                flush=True,
-            )
         goal[h_goal, w_goal] = 1
         return goal
     
@@ -4388,635 +2698,81 @@ class SG_Nav_Agent():
         self.metrics['distance_to_goal'] = metrics['distance_to_goal']
         self.metrics['spl'] = metrics['spl']
         self.metrics['softspl'] = metrics['softspl']
-        if self.args and self.args.visualize:
-            ep_done = self.total_steps == 500
-            sim = getattr(self, "simulator", None)
-            if sim is not None and hasattr(sim, "_env") and hasattr(sim._env, "episode_over"):
-                ep_done = ep_done or sim._env.episode_over
-            if ep_done:
-                self.save_video()
 
     def visualize(self, traversible, observations, number_action):
-        if self.args.visualize:
-            self.refresh_scenegraph_text_for_visualization()
-            # 3-color occupancy panel:
-            # unknown=white, free=light gray, obstacle=dark gray.
-            fm = self.full_map[0, 0].detach().cpu().numpy()
-            fb_tensor = getattr(self, "fbe_free_map_vis", self.fbe_free_map)
-            fb = fb_tensor[0, 0].detach().cpu().numpy()
-            coll = np.asarray(self.collision_map, dtype=np.float32)
-            frame_mode = str(getattr(self, "_last_map_frame_transform", "id"))
-            fm = self._apply_map_frame_transform(fm, frame_mode)
-            fb = self._apply_map_frame_transform(fb, frame_mode)
-            coll = self._apply_map_frame_transform(coll, frame_mode)
-            obs_mask_0 = np.logical_or(
-                fm > float(self._traversible_occ_from_depth_min), coll > 0.5
-            )
-            free_mask_0 = fb > float(self._traversible_free_map_min)
-            # Occupancy panel should always show geometric semantics:
-            # obstacle from depth/collision, free from free-map evidence, rest unknown.
-            # (Do not paint unknown as free even if traversible policy allows unknown.)
-            shown_free_0 = np.logical_and(free_mask_0, ~obs_mask_0)
-
-            h, w = int(fm.shape[0]), int(fm.shape[1])
-            cx_pose_raw = int(self.history_pose[-1][0].item() * 100.0 / self.resolution)
-            cy_pose_raw = int(
-                (self.map_size_cm / 100.0 - self.history_pose[-1][1].item()) * 100.0 / self.resolution
-            )
-            # Visualization panel already uses a display-oriented map frame (legacy ``flipud`` style).
-            # Pose-to-pixel conversion below matches that display frame directly, so applying the
-            # planner frame transform again mirrors the overlay into the opposite corner.
-            raw_cx = max(0, min(w - 1, int(cx_pose_raw)))
-            raw_cy = max(0, min(h - 1, int(cy_pose_raw)))
-            plan_cx = raw_cx
-            plan_cy = raw_cy
-            center_src = "pose_history_display_frame"
-            obs_mask = obs_mask_0
-            radius_cells = int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0))
-            default_free_mask = self._disk_mask_for_center(h, w, plan_cy, plan_cx, radius_cells)
-            default_free_mask = np.logical_and(default_free_mask, np.logical_not(obs_mask))
-            shown_default_free = default_free_mask
-            shown_free = np.logical_and(shown_free_0, np.logical_not(shown_default_free))
-            shown_free_total = np.logical_or(shown_free, shown_default_free)
-            unknown_mask = np.logical_and(~obs_mask, ~shown_free_total)
-
-            def _known_score(cy, cx, win=20):
-                y0 = max(0, int(cy) - win)
-                y1 = min(h, int(cy) + win + 1)
-                x0 = max(0, int(cx) - win)
-                x1 = min(w, int(cx) + win + 1)
-                if y1 <= y0 or x1 <= x0:
-                    return 0.0
-                return float(
-                    np.mean(
-                        np.logical_or(
-                            obs_mask[y0:y1, x0:x1], shown_free_total[y0:y1, x0:x1]
-                        )
-                    )
-                )
-
-            known_raw_ref = _known_score(raw_cy, raw_cx)
-            known_plan = _known_score(plan_cy, plan_cx)
-            acx, acy = plan_cx, plan_cy
-            crop_center_mode = "plan_frame"
-            edge_margin = int(min(acy, h - 1 - acy, acx, w - 1 - acx))
-
-            # Visualization-only fallback. Disabled by default because planner traversible also
-            # contains visited / bootstrap openings, which can look like a duplicated ghost map.
-            if (
-                self._visualize_use_traversible_fallback
-                and float(np.mean(unknown_mask)) > 0.985
-                and traversible is not None
-            ):
-                tr = np.asarray(traversible)
-                if tr.ndim == 2 and tr.shape[0] >= h + 2 and tr.shape[1] >= w + 2:
-                    tr = tr[1:-1, 1:-1]
-                if tr.shape == obs_mask.shape:
-                    tr_free = tr > 0.5
-                    shown_free = np.logical_or(shown_free, np.logical_and(tr_free, ~obs_mask))
-                    shown_free_total = np.logical_or(shown_free, shown_default_free)
-                    unknown_mask = np.logical_and(~obs_mask, ~shown_free_total)
-
-            print(
-                "[SG-Nav][viz_occ] "
-                f"step={self.total_steps} frame={frame_mode} "
-                f"obs={float(np.mean(obs_mask)):.3f} free={float(np.mean(shown_free_total)):.3f} "
-                f"unk={float(np.mean(unknown_mask)):.3f} "
-                f"crop_center={crop_center_mode} "
-                f"known_plan={known_plan:.3f} known_raw_ref={known_raw_ref:.3f} "
-                f"center_plan_rc=({acy},{acx}) edge_margin={edge_margin} "
-                f"center_src={center_src}",
-                flush=True,
-            )
-
-            unknown_rgb = np.array(colors.to_rgb("#FFFFFF"), dtype=np.float64)
-            free_rgb = np.array(colors.to_rgb("#E7E7E7"), dtype=np.float64)
-            default_free_rgb = np.array(colors.to_rgb("#D6D6D6"), dtype=np.float64)
-            obstacle_rgb = np.array(colors.to_rgb("#A2A2A2"), dtype=np.float64)
-            panel_hw3 = np.tile(unknown_rgb, (h, w, 1))
-            panel_hw3[unknown_mask] = unknown_rgb
-            panel_hw3[shown_free] = free_rgb
-            panel_hw3[shown_default_free] = default_free_rgb
-            panel_hw3[obs_mask] = obstacle_rgb
-            paper_map_trans = torch.from_numpy(panel_hw3).permute(2, 0, 1).double()
-            stg_plan_rc = self.visualize_agent_and_goal(paper_map_trans)
-            occ_panel = (paper_map_trans.permute(1, 2, 0) * 255).numpy().astype(np.uint8)
-            ph, pw = int(occ_panel.shape[0]), int(occ_panel.shape[1])
-            acx = max(0, min(pw - 1, acx))
-            acy = max(0, min(ph - 1, acy))
-            # Keep the full global canvas, but translate it for display so the current robot
-            # position stays near the visual center without changing mapping / planning coords.
-            cv2.circle(occ_panel, (acx, acy), 4, (255, 0, 0), -1)
-            occupancy_map = np.full_like(occ_panel, 255)
-            center_x = pw // 2
-            center_y = ph // 2
-            shift_x = int(center_x - acx)
-            shift_y = int(center_y - acy)
-            src_left = max(0, -shift_x)
-            src_top = max(0, -shift_y)
-            dst_left = max(0, shift_x)
-            dst_top = max(0, shift_y)
-            copy_w = min(pw - src_left, pw - dst_left)
-            copy_h = min(ph - src_top, ph - dst_top)
-            if copy_w > 0 and copy_h > 0:
-                occupancy_map[
-                    dst_top : dst_top + copy_h,
-                    dst_left : dst_left + copy_w,
-                ] = occ_panel[
-                    src_top : src_top + copy_h,
-                    src_left : src_left + copy_w,
-                ]
-            stg_disp_rc = None
-            if stg_plan_rc is not None:
-                stg_y, stg_x = int(stg_plan_rc[0]), int(stg_plan_rc[1])
-                stg_x_shift = int(stg_x + shift_x)
-                stg_y_shift = int(stg_y + shift_y)
-                if 0 <= stg_x_shift < pw and 0 <= stg_y_shift < ph:
-                    stg_disp_rc = (stg_y_shift, stg_x_shift)
-                    cv2.drawMarker(
-                        occupancy_map,
-                        (stg_x_shift, stg_y_shift),
-                        (0, 255, 255),
-                        markerType=cv2.MARKER_CROSS,
-                        markerSize=11,
-                        thickness=2,
-                        line_type=cv2.LINE_AA,
-                    )
-            if getattr(self, "_log_pose_align_trace", False):
-                stg_dbg = "None" if stg_plan_rc is None else f"({int(stg_plan_rc[0])},{int(stg_plan_rc[1])})"
-                stg_disp_dbg = "None" if stg_disp_rc is None else f"({int(stg_disp_rc[0])},{int(stg_disp_rc[1])})"
-                print(
-                    "[SG-Nav][viz_stg] "
-                    f"step={self.total_steps} frame={frame_mode} "
-                    f"stg_plan_rc={stg_dbg} start_plan_rc=({acy},{acx}) "
-                    f"shift_xy=({shift_x},{shift_y}) stg_disp_rc={stg_disp_dbg}",
-                    flush=True,
-                )
-            crop_ratio = float(
-                np.clip(getattr(self, "_visualize_centered_crop_ratio", 0.30), 0.10, 1.00)
-            )
-            crop_side = max(41, int(round(float(min(ph, pw)) * crop_ratio)))
-            crop_radius = crop_side // 2
-            crop_radius = int(
-                min(
-                    crop_radius,
-                    center_x,
-                    center_y,
-                    pw - 1 - center_x,
-                    ph - 1 - center_y,
-                )
-            )
-            crop_left = int(max(0, center_x - crop_radius))
-            crop_right = int(min(pw, center_x + crop_radius + 1))
-            crop_top = int(max(0, center_y - crop_radius))
-            crop_bottom = int(min(ph, center_y + crop_radius + 1))
-            occupancy_map_zoom = occupancy_map[crop_top:crop_bottom, crop_left:crop_right]
-            panel_top = 45
-            panel_bottom = 285
-            visualize_image = np.full((360, 800, 3), 255, dtype=np.uint8)
-            det_rgb = self._render_detection_overlay(self.rgb_visualization)
-            visualize_image = add_resized_image(visualize_image, det_rgb, (10, panel_top), (320, 240))
-            visualize_image = add_resized_image_contain(
-                visualize_image,
-                occupancy_map_zoom,
-                (340, panel_top),
-                (180, 240),
-                interpolation_up=cv2.INTER_NEAREST,
-                interpolation_down=cv2.INTER_AREA,
-            )
-            visualize_image = add_rectangle(visualize_image, (10, panel_top), (330, panel_bottom), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (340, panel_top), (520, panel_bottom), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (540, panel_top), (790, 160), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (540, 170), (790, panel_bottom), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (10, 295), (790, 350), (128, 128, 128), thickness=1)
-            visualize_image = add_text(
-                visualize_image,
-                "Observation (Goal: {},  dist={})".format(
-                    self.obj_goal,
-                    "N/A" if self.goal_distance_for_vis is None else f"{self.goal_distance_for_vis:.2f}m",
-                ),
-                (50, 36),
-                font_scale=0.5,
-                thickness=1,
-            )
-            visualize_image = add_text(
-                visualize_image,
-                "Occupancy (unknown/free/obs)",
-                (360, 36),
-                font_scale=0.5,
-                thickness=1,
-            )
-            visualize_image = add_text(visualize_image, "Scene Graph Nodes", (580, 36), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "Scene Graph Edges", (580, 162), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "LLM Explanation", (330, 286), font_scale=0.5, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.text_node, 40), (550, 64), font_scale=0.3, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.text_edge, 40), (550, 190), font_scale=0.3, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.explanation, 150), (20, 314), font_scale=0.3, thickness=1)
-            visualize_image = visualize_image[:, :, ::-1]
-            self.visualize_image_list.append(visualize_image)
-            os.makedirs(os.path.dirname(self.current_frame_path), exist_ok=True)
-            # Write via temp + replace to avoid stale reads on editors that cache file handles.
-            tmp_panel = self.current_frame_path + ".tmp.jpg"
-            tmp_det = self.current_frame_det_path + ".tmp.jpg"
-            cv2.imwrite(tmp_panel, visualize_image)
-            cv2.imwrite(tmp_det, det_rgb[:, :, ::-1])
-            os.replace(tmp_panel, self.current_frame_path)
-            os.replace(tmp_det, self.current_frame_det_path)
-
-            # Also keep per-step snapshots for debugging when IDE image tab does not auto-refresh.
-            os.makedirs(self.current_frame_step_dir, exist_ok=True)
-            step_name = f"current_frame_{int(self.total_steps):06d}.jpg"
-            step_det_name = f"current_frame_det_{int(self.total_steps):06d}.jpg"
-            cv2.imwrite(os.path.join(self.current_frame_step_dir, step_name), visualize_image)
-            cv2.imwrite(os.path.join(self.current_frame_step_dir, step_det_name), det_rgb[:, :, ::-1])
-
-    def _render_detection_overlay(self, rgb_img):
-        """
-        Return an RGB image with GLIP boxes overlaid.
-
-        **Green**: any GLIP detection. **Red**: label matches ``obj_goal`` / match_tokens —
-        only red boxes feed ``goal_bbox`` and navigation. If you see green around the
-        object but no red, the class name does not contain the goal string (e.g. ``tv`` vs ``radio``).
-
-        Drawing uses a temporary BGR image: OpenCV expects BGR ``color=``; applying BGR tuples to an
-        RGB buffer swaps channels (nav red was showing as **blue** in RGB viewers).
-        """
-        vis = np.asarray(rgb_img).copy()
-        preds = getattr(self, "current_obj_predictions", None)
-        if preds is None or len(preds) == 0:
-            return vis
-
-        vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
-
-        labels = []
-        if hasattr(preds, "get_field"):
-            try:
-                labels = list(preds.get_field("labels"))
-            except Exception:
-                labels = []
-        scores = None
-        if hasattr(preds, "get_field"):
-            try:
-                scores = preds.get_field("scores")
-            except Exception:
-                scores = None
-
-        boxes = preds.bbox if hasattr(preds, "bbox") else []
-        n = min(len(boxes), len(labels) if labels else len(boxes))
-        nav_match_count = 0
-        for i in range(n):
-            try:
-                box = boxes[i].to(torch.int64)
-                x1, y1, x2, y2 = [int(v) for v in box.tolist()]
-            except Exception:
-                continue
-            x1 = max(0, min(vis_bgr.shape[1] - 1, x1))
-            y1 = max(0, min(vis_bgr.shape[0] - 1, y1))
-            x2 = max(0, min(vis_bgr.shape[1] - 1, x2))
-            y2 = max(0, min(vis_bgr.shape[0] - 1, y2))
-
-            raw_lab = labels[i] if i < len(labels) else "obj"
-            is_nav = self._navigation_goal_label_match(raw_lab)
-            if is_nav:
-                nav_match_count += 1
-            # BGR: red = nav, green = non-nav GLIP
-            color = (0, 0, 255) if is_nav else (0, 255, 0)
-            cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), color, 2)
-            lab = str(raw_lab)
-            if scores is not None:
-                try:
-                    sc = float(scores[i])
-                    lab = f"{lab}:{sc:.2f}"
-                except Exception:
-                    pass
-            if is_nav:
-                lab = "[nav] " + lab
-            cv2.putText(
-                vis_bgr,
-                lab,
-                (x1, max(12, y1 - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
-        h, w = vis_bgr.shape[:2]
-        hint = f"RED=nav({nav_match_count}) GREEN=other | obj_goal={self.obj_goal!r}"
-        cv2.putText(
-            vis_bgr,
-            hint,
-            (4, h - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (0, 165, 255),
-            1,
-            cv2.LINE_AA,
+        if not (self.args and self.args.visualize):
+            return
+        self.refresh_scenegraph_text_for_visualization()
+        fm = self.full_map[0, 0].detach().cpu().numpy()
+        fb = getattr(self, "fbe_free_map_vis", self.fbe_free_map)[0, 0].detach().cpu().numpy()
+        coll = np.asarray(self.collision_map, dtype=np.float32)
+        h, w = fm.shape[:2]
+        robot_rc = robot_map_rc(self.full_pose, self.map_size_cm, self.resolution, h, w)
+        _, _, occ_panel = build_occupancy_panel(
+            fm, fb, coll, None,
+            float(self._traversible_occ_from_depth_min),
+            float(self._traversible_free_map_min),
+            robot_rc,
+            int(getattr(self, "_traversible_clear_robot_obs_radius_cells", 0)),
         )
-        return cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+        panel_tensor = torch.from_numpy(occ_panel.astype(np.float64) / 255.0).permute(2, 0, 1)
+        stg_plan_rc = paint_agent_and_goal(
+            panel_tensor, self.history_pose,
+            getattr(self, "goal_map", None), None,
+            self.map_size_cm, self.resolution,
+        )
+        occ_panel = (panel_tensor.permute(1, 2, 0) * 255).numpy().astype(np.uint8)
+        det_rgb = render_detection_overlay(
+            self.rgb_visualization,
+            getattr(self, "current_obj_predictions", None),
+            self.obj_goal,
+            self._navigation_goal_label_match,
+        )
+        goal_dist_str = "N/A" if self.goal_distance_for_vis is None else f"{self.goal_distance_for_vis:.2f}m"
+        goal_map_src = str(getattr(self, "_last_goal_map_src_effective", "") or "")
+        visualize_image = compose_visualization_frame(
+            occ_panel=occ_panel, det_rgb=det_rgb,
+            robot_rc=robot_rc, stg_plan_rc=stg_plan_rc,
+            obj_goal=self.obj_goal, goal_distance_str=goal_dist_str,
+            text_node=self.text_node, text_edge=self.text_edge,
+            explanation=self.explanation, goal_map_src=goal_map_src,
+        )
+        visualize_image = visualize_image[:, :, ::-1]
+        self.visualize_image_list.append(visualize_image)
+        os.makedirs(os.path.dirname(self.current_frame_path), exist_ok=True)
+        tmp_panel = self.current_frame_path + ".tmp.jpg"
+        tmp_det = self.current_frame_det_path + ".tmp.jpg"
+        cv2.imwrite(tmp_panel, visualize_image)
+        cv2.imwrite(tmp_det, det_rgb[:, :, ::-1])
+        os.replace(tmp_panel, self.current_frame_path)
+        os.replace(tmp_det, self.current_frame_det_path)
+        os.makedirs(self.current_frame_step_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(self.current_frame_step_dir, f"current_frame_{int(self.total_steps):06d}.jpg"), visualize_image)
+        cv2.imwrite(os.path.join(self.current_frame_step_dir, f"current_frame_det_{int(self.total_steps):06d}.jpg"), det_rgb[:, :, ::-1])
 
     def refresh_scenegraph_text_for_visualization(self):
-        # Keep visualization text in sync with the latest scene graph state.
-        nodes = getattr(self.scenegraph, "nodes", [])
-        global_caps = [node.caption for node in nodes if getattr(node, "caption", None)]
-
-        frame_caps = []
-        seg = getattr(self.scenegraph, "segment2d_results", [])
-        if len(seg) > 0 and isinstance(seg[-1], dict):
-            frame_caps = [str(c) for c in seg[-1].get("caption", []) if str(c).strip()]
-
-        if self.show_frame_nodes_only:
-            src = frame_caps if len(frame_caps) > 0 else global_caps
-            self.text_node = ", ".join(src)
-        else:
-            # Show both scopes for debugging consistency between current RGB and global graph memory.
-            frame_text = ", ".join(frame_caps[:24]) if frame_caps else "-"
-            global_text = ", ".join(global_caps[:24]) if global_caps else "-"
-            self.text_node = f"[frame] {frame_text} | [global] {global_text}"
-
-        edge_lines = []
-        seen = set()
-        for node in nodes:
-            for edge in getattr(node, "edges", []):
-                relation = getattr(edge, "relation", None)
-                n1 = getattr(edge.node1, "caption", None)
-                n2 = getattr(edge.node2, "caption", None)
-                if not n1 or not n2 or not relation:
-                    continue
-                key = tuple(sorted([n1, n2]) + [relation])
-                if key in seen:
-                    continue
-                seen.add(key)
-                edge_lines.append(f"({n1}, {relation}, {n2})")
-        self.text_edge = "; ".join(edge_lines)
-
-        reason = getattr(self.scenegraph, "reason_visualization", "")
-        if reason:
-            self.explanation = reason
-        elif self.text_edge:
-            self.explanation = "Edge relations are derived from VLM/LLM proposals."
-        elif self.text_node:
-            # Prefer actual node / frame captions over a generic skip_edge_llm banner.
-            tail = ""
-            if getattr(self.scenegraph, "runtime_cfg", None) and self.scenegraph.runtime_cfg.get(
-                "skip_edge_llm", False
-            ):
-                tail = " | edges off (skip_edge_llm)"
-            self.explanation = f"{self.text_node[:300]}{tail}"
-        elif getattr(self.scenegraph, "runtime_cfg", None) and self.scenegraph.runtime_cfg.get(
-            "skip_edge_llm", False
-        ):
-            self.explanation = (
-                "No scene-graph node text this frame. Edge/VLM is off (skip_edge_llm); "
-                "enable it in yaml for relation-based explanations."
-            )
-        else:
-            self.explanation = "Scene graph is empty for the current frame."
+        self.text_node, self.text_edge, self.explanation = build_scenegraph_text(
+            self.scenegraph, self.show_frame_nodes_only,
+        )
 
     def save_video(self):
-        """Write episode visualization to MP4.
-
-        OpenCV ``mp4v`` (MPEG-4 Part 2) is valid but many players (e.g. Windows Media Player,
-        some browsers) handle H.264 better. When ``ffmpeg`` is on PATH, we transcode to
-        libx264 + yuv420p and ``+faststart`` so files are broadly playable and the moov atom
-        is near the start of the file.
-        """
-        save_video_dir = os.path.join(self.visualization_dir, "video")
-        os.makedirs(save_video_dir, exist_ok=True)
-        base = f"vid_{self.count_episodes:06d}"
-        final_path = os.path.join(save_video_dir, f"{base}.mp4")
-        tmp_path = os.path.join(save_video_dir, f"{base}.partial.mp4")
-
-        if not self.visualize_image_list:
-            return
-
-        height, width = self.visualize_image_list[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video = cv2.VideoWriter(tmp_path, fourcc, 4.0, (width, height))
-        opened = video.isOpened()
-        try:
-            if not opened:
-                import sys
-
-                sys.stderr.write(
-                    "[SG_Nav] VideoWriter failed to open (codec/backend). "
-                    f"path={tmp_path!r} size={width}x{height}\n"
-                )
-                return
-            for visualize_image in self.visualize_image_list:
-                video.write(visualize_image)
-        finally:
-            video.release()
-
-        ffmpeg_bin = shutil.which("ffmpeg")
-        if ffmpeg_bin:
-            h264_tmp = os.path.join(save_video_dir, f"{base}.h264.tmp.mp4")
-            cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                tmp_path,
-                "-an",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "veryfast",
-                "-movflags",
-                "+faststart",
-                h264_tmp,
-            ]
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                if (
-                    r.returncode == 0
-                    and os.path.isfile(h264_tmp)
-                    and os.path.getsize(h264_tmp) > 0
-                ):
-                    os.remove(tmp_path)
-                    os.replace(h264_tmp, final_path)
-                    return
-            except OSError:
-                pass
-            if os.path.isfile(h264_tmp):
-                try:
-                    os.remove(h264_tmp)
-                except OSError:
-                    pass
-
-        os.replace(tmp_path, final_path)
+        _save_video_impl(
+            self.visualize_image_list,
+            os.path.join(self.visualization_dir, "video"),
+            self.count_episodes,
+        )
 
     def save_scenegraph_json_snapshot(self):
-        scenegraph = getattr(self, "scenegraph", None)
-        if scenegraph is None:
+        sg = getattr(self, "scenegraph", None)
+        if sg is None:
             return
-
-        nodes = list(getattr(scenegraph, "nodes", []))
-        node_idx = {id(node): i for i, node in enumerate(nodes)}
-        json_nodes = []
-        for i, node in enumerate(nodes):
-            center = getattr(node, "center", None)
-            room_node = getattr(node, "room_node", None)
-            json_nodes.append(
-                {
-                    "id": i,
-                    "caption": str(getattr(node, "caption", "") or ""),
-                    "center": [int(center[0]), int(center[1])] if center is not None else None,
-                    "room": str(getattr(room_node, "caption", "") or ""),
-                    "is_goal_node": bool(getattr(node, "is_goal_node", False)),
-                }
-            )
-
-        seen_edges = set()
-        json_edges = []
-        for node in nodes:
-            for edge in getattr(node, "edges", []):
-                eid = id(edge)
-                if eid in seen_edges:
-                    continue
-                seen_edges.add(eid)
-                n1 = getattr(edge, "node1", None)
-                n2 = getattr(edge, "node2", None)
-                if n1 is None or n2 is None:
-                    continue
-                json_edges.append(
-                    {
-                        "node1_id": node_idx.get(id(n1)),
-                        "node1_caption": str(getattr(n1, "caption", "") or ""),
-                        "node2_id": node_idx.get(id(n2)),
-                        "node2_caption": str(getattr(n2, "caption", "") or ""),
-                        "relation": getattr(edge, "relation", None),
-                    }
-                )
-
-        payload = {
-            "step": int(self.total_steps),
-            "navigate_step": int(self.navigate_steps),
-            "obj_goal": str(getattr(self, "obj_goal", "")),
-            "obj_goal_sg": str(getattr(self, "obj_goal_sg", "")),
-            "found_goal": bool(getattr(self, "found_goal", False)),
-            "found_possible_goal": bool(getattr(self, "found_possible_goal", False)),
-            "nodes": json_nodes,
-            "edges": json_edges,
-        }
-
-        os.makedirs(os.path.dirname(self.scenegraph_json_path), exist_ok=True)
-        os.makedirs(self.scenegraph_json_step_dir, exist_ok=True)
-
-        latest_tmp = self.scenegraph_json_path + ".tmp"
-        with open(latest_tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(latest_tmp, self.scenegraph_json_path)
-
-        step_path = os.path.join(self.scenegraph_json_step_dir, f"scenegraph_{int(self.total_steps):06d}.json")
-        with open(step_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    def visualize_agent_and_goal(self, map):
-        frame_mode = str(getattr(self, "_last_map_frame_transform", "id"))
-        h, w = int(map.shape[1]), int(map.shape[2])
-
-        def _paint_square(center_r: int, center_c: int, size: int, color_index: int, alpha: float = 1.0):
-            y0 = max(0, int(center_r) - size)
-            y1 = min(h, int(center_r) + size)
-            x0 = max(0, int(center_c) - size)
-            x1 = min(w, int(center_c) + size)
-            if y1 <= y0 or x1 <= x0:
-                return
-            color_ori = map[:, y0:y1, x0:x1]
-            color_new = torch.zeros_like(color_ori)
-            color_new[color_index] = 1
-            map[:, y0:y1, x0:x1] = alpha * color_new + (1 - alpha) * color_ori
-
-        def _paint_square_rgb(center_r: int, center_c: int, size: int, rgb, alpha: float = 1.0):
-            y0 = max(0, int(center_r) - size)
-            y1 = min(h, int(center_r) + size)
-            x0 = max(0, int(center_c) - size)
-            x1 = min(w, int(center_c) + size)
-            if y1 <= y0 or x1 <= x0:
-                return
-            color_ori = map[:, y0:y1, x0:x1]
-            color_new = torch.zeros_like(color_ori)
-            for ch, value in enumerate(rgb):
-                color_new[ch] = float(value)
-            map[:, y0:y1, x0:x1] = alpha * color_new + (1 - alpha) * color_ori
-
-        for idx, pose in enumerate(self.history_pose):
-            draw_step_num = 30
-            alpha = max(0, 1 - (len(self.history_pose) - idx) / draw_step_num)
-            agent_size = 2 if idx == len(self.history_pose) - 1 else 1
-            px = float(pose[0].item() if hasattr(pose[0], "item") else pose[0])
-            py = float(pose[1].item() if hasattr(pose[1], "item") else pose[1])
-            rx = int(np.clip(int(px * 100.0 / self.resolution), 0, w - 1))
-            ry = int(
-                np.clip(
-                    int((self.map_size_cm / 100.0 - py) * 100.0 / self.resolution),
-                    0,
-                    h - 1,
-                )
-            )
-            _paint_square(ry, rx, agent_size, color_index=0, alpha=alpha)
-
-        goal_map = getattr(self, "goal_map", None)
-        if goal_map is not None:
-            goal_src = str(
-                getattr(self, "_goal_map_src_for_visualization", None)
-                or getattr(self, "_last_goal_map_src_effective", None)
-                or ""
-            )
-            goal_map_vis = np.asarray(goal_map)
-            # Keep all goal sources in raw map coordinates; the occupancy panel already uses the
-            # display/planning frame, so transform once here for every source.
-            goal_map_vis = self._apply_map_frame_transform(goal_map_vis, frame_mode)
-            ys, xs = np.where(goal_map_vis == 1)
-            if len(ys) > 0:
-                _paint_square(int(ys[0]), int(xs[0]), size=2, color_index=1, alpha=1.0)
-
-        planner_dbg = getattr(self, "_last_planner_debug", None)
-        stg_plan_rc = None
-        if isinstance(planner_dbg, dict):
-            stg = planner_dbg.get("stg")
-            if stg is not None and len(stg) >= 2:
-                stg_r = int(np.clip(int(stg[0]), 0, h - 1))
-                stg_c = int(np.clip(int(stg[1]), 0, w - 1))
-                # Yellow short-term goal marker so it stands apart from the green long-term goal.
-                _paint_square_rgb(stg_r, stg_c, size=2, rgb=(1.0, 1.0, 0.0), alpha=1.0)
-                stg_plan_rc = (stg_r, stg_c)
-        return stg_plan_rc
+        _save_scenegraph_json_impl(
+            sg, int(self.total_steps), int(self.navigate_steps),
+            str(getattr(self, "obj_goal", "")),
+            str(getattr(self, "obj_goal_sg", "")),
+            bool(getattr(self, "found_goal", False)),
+            bool(getattr(self, "found_possible_goal", False)),
+            self.scenegraph_json_path, self.scenegraph_json_step_dir,
+        )
 
 
-def main():
-    try:
-        import habitat
-    except Exception as e:
-        raise RuntimeError(
-            "Running SG_Nav.py main() requires habitat-lab/habitat-sim (for get_config + Challenge). "
-            "You can still import/use SG_Nav_Agent without habitat (e.g. HTTP server + OmegaConf config)."
-        ) from e
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--visualize", action='store_true'
-    )
-    parser.add_argument(
-        "--split_l", default=0, type=int
-    )
-    parser.add_argument(
-        "--split_r", default=11, type=int
-    )
-    args = parser.parse_args()
-    os.environ["CHALLENGE_CONFIG_FILE"] = "configs/challenge_objectnav2021.local.rgbd.yaml"
-    config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
-    config = habitat.get_config(config_paths)
-    agent = SG_Nav_Agent(task_config=config, args=args)
-
-    challenge = habitat.Challenge(eval_remote=False, split_l=args.split_l, split_r=args.split_r)
-
-    challenge.submit(agent)
-
-
-if __name__ == "__main__":
-    main()
